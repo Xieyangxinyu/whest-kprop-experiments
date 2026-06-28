@@ -18,19 +18,22 @@ from whestbench import MLP, BaseEstimator, SetupContext
 
 _PILOT_SAMPLES = int(os.environ.get("WHEST_ACTIVE_PILOT_SAMPLES", "512"))
 _MAIN_SAMPLES = int(os.environ.get("WHEST_ACTIVE_MAIN_SAMPLES", "12288"))
-_FIRE_THRESHOLD = float(os.environ.get("WHEST_ACTIVE_FIRE_THRESHOLD", "0.02"))
+_FIRE_THRESHOLD = float(os.environ.get("WHEST_ACTIVE_FIRE_THRESHOLD", "0.005"))
 _FIRE_THRESHOLD_GROWTH = float(os.environ.get("WHEST_FIRE_THRESHOLD_GROWTH", "0.0"))
 _USE_ANTITHETIC = os.environ.get("WHEST_ACTIVE_USE_ANTITHETIC", "1") != "0"
 _NLN_FALLBACK_BLEND = float(os.environ.get("WHEST_NLN_FALLBACK_BLEND", "0.15"))
 _NLN_KEEP_FRACTION = float(os.environ.get("WHEST_NLN_KEEP_FRACTION", "0.15"))
 _NLN_MIN_POSITIVES = float(os.environ.get("WHEST_NLN_MIN_POSITIVES", "8"))
 _NLN_LOGVAR_CAP = float(os.environ.get("WHEST_NLN_LOGVAR_CAP", "4.0"))
+_USE_LOGNORMAL_PILOT = os.environ.get("WHEST_USE_LOGNORMAL_PILOT", "0") != "0"
 _COV_CORR_THRESHOLD = float(os.environ.get("WHEST_SPARSE_COV_CORR_THRESHOLD", "0.06"))
 _COV_MIN_DEGREE = float(os.environ.get("WHEST_SPARSE_COV_MIN_DEGREE", "8"))
 _COV_CORE_DEGREE = float(os.environ.get("WHEST_SPARSE_COV_CORE_DEGREE", "16"))
-_USE_SPARSE_COV = os.environ.get("WHEST_USE_SPARSE_COV", "1") != "0"
+_USE_SPARSE_COV = os.environ.get("WHEST_USE_SPARSE_COV", "0") != "0"
 _MOMENT_MATCH_INPUTS = os.environ.get("WHEST_MOMENT_MATCH_INPUTS", "0") != "0"
 _REUSE_PILOT_SAMPLES = os.environ.get("WHEST_REUSE_PILOT_SAMPLES", "1") != "0"
+_PILOT_REUSE_MULTIPLIER = float(os.environ.get("WHEST_PILOT_REUSE_MULTIPLIER", "1.0"))
+_FIRING_PILOT_BOOST = float(os.environ.get("WHEST_FIRING_PILOT_BOOST", "0.0"))
 _PERIPHERAL_SHRINK = float(os.environ.get("WHEST_PERIPHERAL_SHRINK", "0.0"))
 _BLOCK_RESTART_LAYER = int(os.environ.get("WHEST_BLOCK_RESTART_LAYER", "0"))
 _BLOCK_RESTART_MODE = os.environ.get("WHEST_BLOCK_RESTART_MODE", "lognormal")
@@ -45,8 +48,14 @@ _IMPORTANCE_WEIGHT_CLIP = float(os.environ.get("WHEST_IMPORTANCE_WEIGHT_CLIP", "
 _IMPORTANCE_DIRECTION_MODE = os.environ.get("WHEST_IMPORTANCE_DIRECTION_MODE", "gradient")
 _USE_WHITEBOX_LOOKAHEAD = os.environ.get("WHEST_WHITEBOX_LOOKAHEAD", "0") != "0"
 _LOOKAHEAD_FALLBACK_BLEND = float(os.environ.get("WHEST_LOOKAHEAD_FALLBACK_BLEND", "0.25"))
-_USE_MAGNITUDE_CORE = os.environ.get("WHEST_USE_MAGNITUDE_CORE", "0") != "0"
-_MAGNITUDE_CORE_FRACTION = float(os.environ.get("WHEST_MAGNITUDE_CORE_FRACTION", "0.75"))
+_COV_LOOKAHEAD_BLEND = float(os.environ.get("WHEST_COV_LOOKAHEAD_BLEND", "0.0"))
+_USE_MAGNITUDE_CORE = os.environ.get("WHEST_USE_MAGNITUDE_CORE", "1") != "0"
+_MAGNITUDE_CORE_FRACTION = float(os.environ.get("WHEST_MAGNITUDE_CORE_FRACTION", "0.5"))
+_USE_DIAGONAL_CORE = os.environ.get("WHEST_USE_DIAGONAL_CORE", "0") != "0"
+_DIAGONAL_CORE_RMS_FRACTION = float(os.environ.get("WHEST_DIAGONAL_CORE_RMS_FRACTION", "0.75"))
+_DIAGONAL_CORE_MEAN_FRACTION = float(os.environ.get("WHEST_DIAGONAL_CORE_MEAN_FRACTION", "0.75"))
+_LINEARIZE_HIGH_FIRING = os.environ.get("WHEST_LINEARIZE_HIGH_FIRING", "0") != "0"
+_LINEARIZE_FIRE_THRESHOLD = float(os.environ.get("WHEST_LINEARIZE_FIRE_THRESHOLD", "0.98"))
 _INV_SQRT_TWO_PI = 0.3989422804014327
 _RELU_STANDARD_NORMAL_VAR = 0.5 - _INV_SQRT_TWO_PI * _INV_SQRT_TWO_PI
 
@@ -127,6 +136,10 @@ def _positive_slab_lognormal_stats(
     positive = x > 0.0
     positive_count = fnp.sum(positive, axis=0)
     sample_count = float(x.shape[0])
+    firing_rate = (positive_count + 0.5) / (sample_count + 1.0)
+
+    if not _USE_LOGNORMAL_PILOT:
+        return pilot_mean, fnp.zeros(pilot_mean.shape, dtype=bool), firing_rate, pilot_mean, fnp.zeros(pilot_mean.shape)
 
     log_x = fnp.where(positive, fnp.log(fnp.maximum(x, 1e-30)), 0.0)
     count_for_logs = fnp.maximum(positive_count, 1.0)
@@ -135,7 +148,6 @@ def _positive_slab_lognormal_stats(
     log_var = fnp.sum(log_centered * log_centered, axis=0) / fnp.maximum(positive_count - 1.0, 1.0)
     log_var = fnp.minimum(log_var, _NLN_LOGVAR_CAP)
 
-    firing_rate = (positive_count + 0.5) / (sample_count + 1.0)
     nln_mean = firing_rate * fnp.exp(log_mean + 0.5 * log_var)
     reliability = fnp.minimum(1.0, positive_count / _NLN_MIN_POSITIVES)
     fallback_mean = pilot_mean + _NLN_FALLBACK_BLEND * reliability * (nln_mean - pilot_mean)
@@ -143,6 +155,16 @@ def _positive_slab_lognormal_stats(
     layer_scale = fnp.maximum(fnp.mean(pilot_mean), 1e-12)
     nln_keep = (positive_count >= _NLN_MIN_POSITIVES) & (nln_mean >= _NLN_KEEP_FRACTION * layer_scale)
     return fallback_mean, nln_keep, firing_rate, log_mean, log_var
+
+
+def _diagonal_core_keep(x: fnp.ndarray, pilot_mean: fnp.ndarray) -> fnp.ndarray:
+    second_moment = fnp.mean(x * x, axis=0)
+    rms = fnp.sqrt(fnp.maximum(second_moment, 1e-12))
+    layer_rms = fnp.maximum(fnp.mean(rms), 1e-12)
+    layer_mean = fnp.maximum(fnp.mean(pilot_mean), 1e-12)
+    return (rms >= _DIAGONAL_CORE_RMS_FRACTION * layer_rms) | (
+        pilot_mean >= _DIAGONAL_CORE_MEAN_FRACTION * layer_mean
+    )
 
 
 def _sample_zero_inflated_lognormal(
@@ -157,6 +179,16 @@ def _sample_zero_inflated_lognormal(
 
 def _combine_means(old_mean: fnp.ndarray, old_count: float, new_mean: fnp.ndarray, new_count: float) -> fnp.ndarray:
     return (old_mean * old_count + new_mean * new_count) / (old_count + new_count)
+
+
+def _replace_indices(base: fnp.ndarray, idx: fnp.ndarray, values: fnp.ndarray, width: int) -> fnp.ndarray:
+    positions = fnp.reshape(fnp.arange(width), (width, 1))
+    idx_row = fnp.reshape(idx, (1, idx.shape[0]))
+    values_row = fnp.reshape(values, (1, values.shape[0]))
+    matches = positions == idx_row
+    replacement = fnp.sum(fnp.where(matches, values_row, 0.0), axis=1)
+    mask = fnp.sum(matches, axis=1) > 0
+    return fnp.where(mask, replacement, base)
 
 
 def _weighted_mean(x: fnp.ndarray, weights: fnp.ndarray) -> fnp.ndarray:
@@ -197,6 +229,24 @@ def _elite_importance_direction(
     return direction / fnp.maximum(fnp.sqrt(fnp.sum(direction * direction)), 1e-12)
 
 
+def _covariance_elite_importance_direction(
+    pilot_inputs: fnp.ndarray, final_pilot_x: fnp.ndarray, fallback_rows, cov_degree_rows
+) -> fnp.ndarray:
+    base = fallback_rows[-1] * (1.0 + cov_degree_rows[-1] / _COV_CORE_DEGREE)
+    base = base / fnp.maximum(fnp.sqrt(fnp.sum(base * base)), 1e-12)
+
+    final_centered = final_pilot_x - fnp.mean(final_pilot_x, axis=0)
+    cov_target = final_centered.T @ (final_centered @ base)
+    cov_target = cov_target / fnp.maximum(float(final_pilot_x.shape[0] - 1), 1.0)
+    cov_target = cov_target / fnp.maximum(fnp.sqrt(fnp.sum(cov_target * cov_target)), 1e-12)
+
+    rewards = final_centered @ cov_target
+    elite_weight = fnp.maximum(rewards - fnp.mean(rewards), 0.0)
+    direction = elite_weight @ pilot_inputs
+    direction = direction / fnp.maximum(fnp.sum(elite_weight), 1e-12)
+    return direction / fnp.maximum(fnp.sqrt(fnp.sum(direction * direction)), 1e-12)
+
+
 def _tilted_first_layer_activations(
     rng, n_samples: int, w: fnp.ndarray, width: int, direction: fnp.ndarray
 ) -> tuple[fnp.ndarray, fnp.ndarray]:
@@ -222,10 +272,18 @@ def _tilted_first_layer_activations(
 
 
 def _positive_covariance_degree(x: fnp.ndarray, pilot_mean: fnp.ndarray) -> fnp.ndarray:
+    cov = _pilot_covariance(x, pilot_mean)
+    return _positive_covariance_degree_from_cov(cov)
+
+
+def _pilot_covariance(x: fnp.ndarray, pilot_mean: fnp.ndarray) -> fnp.ndarray:
     centered = x - pilot_mean
     sample_count = max(1, x.shape[0] - 1)
     cov_raw = (centered.T @ centered) / float(sample_count)
-    cov = flops.as_symmetric(0.5 * (cov_raw + cov_raw.T), symmetry=(0, 1))
+    return flops.as_symmetric(0.5 * (cov_raw + cov_raw.T), symmetry=(0, 1))
+
+
+def _positive_covariance_degree_from_cov(cov: fnp.ndarray) -> fnp.ndarray:
     var = fnp.maximum(fnp.diag(cov), 1e-12)
     inv_std = 1.0 / fnp.sqrt(var)
     corr_raw = cov * fnp.outer(inv_std, inv_std)
@@ -266,6 +324,14 @@ def _gaussian_relu_lookahead(
     return mean, var, Phi
 
 
+def _covariance_relu_lookahead(prev_mean: fnp.ndarray, prev_cov: fnp.ndarray, w: fnp.ndarray) -> fnp.ndarray:
+    pre_mean = prev_mean @ w
+    pre_var = fnp.maximum(fnp.einsum("ij,ik,jk->k", prev_cov, w, w), 1e-12)
+    pre_sigma = fnp.sqrt(pre_var)
+    alpha = pre_mean / pre_sigma
+    return pre_mean * flops.stats.norm.cdf(alpha) + pre_sigma * flops.stats.norm.pdf(alpha)
+
+
 class Estimator(BaseEstimator):
     """Active-set antithetic sampler for WHest activation means.
 
@@ -292,6 +358,7 @@ class Estimator(BaseEstimator):
         x = None
         pilot_inputs = None
         pilot_sample_count = float(_actual_sample_count(_PILOT_SAMPLES))
+        pilot_effective_count = pilot_sample_count * _PILOT_REUSE_MULTIPLIER
         fallback_rows = []
         pilot_rows = []
         cov_degree_rows = []
@@ -299,6 +366,8 @@ class Estimator(BaseEstimator):
         block_stats = None
         active_indices = []
         active_counts = []
+        prev_pilot_mean = None
+        prev_pilot_cov = None
         for layer_idx, w in enumerate(mlp.weights):
             if layer_idx == 0:
                 x, pilot_inputs = _first_layer_activations_and_inputs(rng, _PILOT_SAMPLES, w, width)
@@ -310,29 +379,50 @@ class Estimator(BaseEstimator):
                 pilot_rows.append(exact_mean)
                 cov_degree_rows.append(fnp.ones(width) * _COV_CORE_DEGREE)
                 gate_rows.append(fnp.ones(width) * 0.5)
+                prev_pilot_mean = exact_mean
+                if _COV_LOOKAHEAD_BLEND > 0.0:
+                    prev_pilot_cov = _pilot_covariance(x, fnp.mean(x, axis=0))
                 continue
 
             x = fnp.maximum(x @ w, 0.0)
             pilot_mean = fnp.mean(x, axis=0)
             firing_rate = fnp.mean(x > 0.0, axis=0)
+            lookahead_mean = None
+            if _COV_LOOKAHEAD_BLEND > 0.0 and prev_pilot_mean is not None and prev_pilot_cov is not None:
+                lookahead_mean = _covariance_relu_lookahead(prev_pilot_mean, prev_pilot_cov, w)
+
             if not _use_block_classification(layer_idx):
                 idx = fnp.arange(width)
+                pilot_reference = pilot_mean
+                if lookahead_mean is not None:
+                    pilot_reference = pilot_mean + _COV_LOOKAHEAD_BLEND * (lookahead_mean - pilot_mean)
                 active_indices.append(idx)
                 active_counts.append(width)
-                fallback_rows.append(pilot_mean)
-                pilot_rows.append(pilot_mean)
+                fallback_rows.append(pilot_reference)
+                pilot_rows.append(pilot_reference)
                 cov_degree_rows.append(fnp.ones(width) * _COV_CORE_DEGREE)
                 gate_rows.append(firing_rate)
+                prev_pilot_mean = pilot_reference
+                if _COV_LOOKAHEAD_BLEND > 0.0 and layer_idx + 2 >= _BLOCK_CLASS_START_LAYER:
+                    prev_pilot_cov = _pilot_covariance(x, pilot_mean)
                 continue
 
             fallback_mean, nln_keep, nln_rate, log_mean, log_var = _positive_slab_lognormal_stats(x, pilot_mean)
+            pilot_reference = pilot_mean
+            if lookahead_mean is not None:
+                fallback_mean = fallback_mean + _COV_LOOKAHEAD_BLEND * (lookahead_mean - fallback_mean)
+                pilot_reference = pilot_mean + _COV_LOOKAHEAD_BLEND * (lookahead_mean - pilot_mean)
             keep = (firing_rate >= _layer_fire_threshold(layer_idx, mlp.depth)) | nln_keep
             layer_scale = fnp.maximum(fnp.mean(pilot_mean), 1e-12)
             if _USE_MAGNITUDE_CORE:
                 keep = keep | (fallback_mean >= _MAGNITUDE_CORE_FRACTION * layer_scale)
+            if _USE_DIAGONAL_CORE:
+                keep = keep | _diagonal_core_keep(x, pilot_mean)
             cov_degree = fnp.zeros(width)
+            pilot_cov = None
             if _USE_SPARSE_COV:
-                cov_degree = _positive_covariance_degree(x, pilot_mean)
+                pilot_cov = _pilot_covariance(x, pilot_mean)
+                cov_degree = _positive_covariance_degree_from_cov(pilot_cov)
                 keep = keep | (cov_degree >= _COV_MIN_DEGREE)
             if _SIMPLIFY_IDENTITY:
                 identity_drop = (cov_degree <= _IDENTITY_MAX_DEGREE) & (
@@ -343,9 +433,14 @@ class Estimator(BaseEstimator):
             active_indices.append(idx)
             active_counts.append(int(fnp.sum(keep)))
             fallback_rows.append(fallback_mean)
-            pilot_rows.append(pilot_mean)
+            pilot_rows.append(pilot_reference)
             cov_degree_rows.append(cov_degree)
             gate_rows.append(firing_rate)
+            prev_pilot_mean = pilot_reference
+            if _COV_LOOKAHEAD_BLEND > 0.0:
+                if pilot_cov is None:
+                    pilot_cov = _pilot_covariance(x, pilot_mean)
+                prev_pilot_cov = pilot_cov
             if _BLOCK_RESTART_LAYER == layer_idx + 1:
                 block_stats = (layer_idx, nln_rate, log_mean, log_var, x)
         final_pilot_x = x
@@ -396,25 +491,37 @@ class Estimator(BaseEstimator):
             w_active = w[prev_idx, :][:, idx]
             main_weight_slices.append((layer_idx, w_active))
 
-            x_main = fnp.maximum(x_main @ w_active, 0.0)
+            active_pre = x_main @ w_active
+            if _LINEARIZE_HIGH_FIRING:
+                linear_mask = gate_rows[layer_idx][idx] >= _LINEARIZE_FIRE_THRESHOLD
+                x_main = fnp.where(linear_mask, active_pre, fnp.maximum(active_pre, 0.0))
+            else:
+                x_main = fnp.maximum(active_pre, 0.0)
             active_mean = fnp.mean(x_main, axis=0)
             if _REUSE_PILOT_SAMPLES:
+                active_pilot_count = pilot_effective_count
+                if _FIRING_PILOT_BOOST != 0.0:
+                    active_pilot_count = pilot_effective_count * (
+                        1.0 + _FIRING_PILOT_BOOST * gate_rows[layer_idx][idx]
+                    )
                 active_mean = (
-                    active_mean * main_sample_count + pilot_rows[layer_idx][idx] * pilot_sample_count
-                ) / (main_sample_count + pilot_sample_count)
+                    active_mean * main_sample_count + pilot_rows[layer_idx][idx] * active_pilot_count
+                ) / (main_sample_count + active_pilot_count)
             if _PERIPHERAL_SHRINK > 0.0:
                 sample_weight = _core_sample_weight(cov_degree_rows[layer_idx][idx])
                 fallback_active = fallback_rows[layer_idx][idx]
                 active_mean = fallback_active + sample_weight * (active_mean - fallback_active)
 
-            row = fallback_rows[layer_idx]
-            row = row.copy()
-            row[idx] = active_mean
+            row = _replace_indices(fallback_rows[layer_idx], idx, active_mean, width)
             rows.append(row)
             prev_idx = idx
 
         if _IMPORTANCE_SAMPLES > 0 and restart_layer_idx < 0:
-            if _IMPORTANCE_DIRECTION_MODE == "elite":
+            if _IMPORTANCE_DIRECTION_MODE == "cov_elite":
+                direction = _covariance_elite_importance_direction(
+                    pilot_inputs, final_pilot_x, fallback_rows, cov_degree_rows
+                )
+            elif _IMPORTANCE_DIRECTION_MODE == "elite":
                 direction = _elite_importance_direction(pilot_inputs, final_pilot_x, fallback_rows, cov_degree_rows)
             else:
                 direction = _importance_direction(mlp, active_indices, gate_rows, fallback_rows, cov_degree_rows)
@@ -442,8 +549,8 @@ class Estimator(BaseEstimator):
 
                 importance_mean = _weighted_mean(x_importance, importance_weights)
                 row = rows[layer_idx]
-                row = row.copy()
-                row[idx] = _combine_means(row[idx], main_sample_count + pilot_sample_count, importance_mean, importance_count)
+                updated = _combine_means(row[idx], main_sample_count + pilot_effective_count, importance_mean, importance_count)
+                row = _replace_indices(row, idx, updated, width)
                 rows[layer_idx] = row
 
         if _ADAPTIVE_EXTRA_SAMPLES > 0:
@@ -470,8 +577,8 @@ class Estimator(BaseEstimator):
 
                 extra_mean = fnp.mean(x_extra, axis=0)
                 row = rows[layer_idx]
-                row = row.copy()
-                row[idx] = _combine_means(row[idx], main_sample_count + pilot_sample_count, extra_mean, extra_count)
+                updated = _combine_means(row[idx], main_sample_count + pilot_effective_count, extra_mean, extra_count)
+                row = _replace_indices(row, idx, updated, width)
                 rows[layer_idx] = row
 
         return fnp.stack(rows, axis=0)

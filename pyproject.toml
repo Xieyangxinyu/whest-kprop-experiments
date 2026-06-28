@@ -12,6 +12,12 @@ dependencies = [
     "whestbench>=0.12.0rc0,<0.13.0",
 ]
 
+[project.optional-dependencies]
+notebook = [
+    "matplotlib>=3.10.9",
+    "scipy>=1.15.3",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.2.0",

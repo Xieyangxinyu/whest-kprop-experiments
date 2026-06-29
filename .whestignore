@@ -29,3 +29,8 @@ Makefile
 README.md
 pyproject.toml
 uv.lock
+
+# Notebooks and logs (not needed by grader)
+*.ipynb
+bench_logs/
+submission-*.tar.gz

@@ -23,5 +23,14 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Local agent/runtime state
+.tmp/
+.claude/settings.local.json
+.claude/*.lock
+.claude/skill_usage.jsonl
+.claude/decision_log.jsonl
+.claude/plans/
+.claude/worktrees/
+
 # Internal process docs (specs, plans, scratch) — not for participant repo.
 .aicrowd/

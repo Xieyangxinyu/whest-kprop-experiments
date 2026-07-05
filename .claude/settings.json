@@ -1,0 +1,19 @@
+{
+  "enabledPlugins": {
+    "pyright-lsp@claude-plugins-official": true
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/scripts/bootstrap-env.sh\" 2>&1 | tail -2",
+            "timeout": 300,
+            "statusMessage": "Bootstrapping uv environment..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -18,6 +18,11 @@ notebook = [
     "scipy>=1.15.3",
 ]
 
+[tool.setuptools]
+# Flat script layout: only these top-level modules are part of the package.
+# Without this, setuptools auto-discovery chokes on assets/ and bench_logs/.
+py-modules = ["estimator", "local_engine"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.2.0",

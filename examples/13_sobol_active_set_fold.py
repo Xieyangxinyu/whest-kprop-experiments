@@ -1,17 +1,17 @@
-"""Sobol QMC Active-Set Estimator with Layer Fold (Submission #313687).
+"""Sobol QMC Active-Set Estimator with Layer Fold.
 
-This is the best-scoring estimator (~3.3e-07 adjusted_final_layer_score).
-It combines four key ideas:
+This is the best-scoring estimator family (currently testing N=40960).
+It combines six key ideas:
 
 1. **Analytical classification** — propagate diagonal mean/variance through
-   ReLU layers to compute α = μ/σ per neuron. Classify as dead (α < -2.5),
-   always-on (α > 2.5), or kink. No pilot pass needed (saves ~2.7B FLOPs).
+   ReLU layers to compute α = μ/σ per neuron. Classify as dead (α < -3.0),
+    always-on (α > 3.0), or kink. No pilot pass needed (saves ~2.7B FLOPs).
 
-2. **Sobol QMC inputs** — pre-generate 8192 Sobol N(0,1) points offline
+2. **Sobol QMC inputs** — pre-generate 20480 Sobol N(0,1) points offline
    (scrambled, ndtri-transformed), ship as `sobol_points.npz`. Better space-
    filling than pseudo-random gives lower MC variance at same N.
 
-3. **Antithetic pairing** — concatenate half and -half to get N=16384 effective
+3. **Antithetic pairing** — concatenate half and -half to get N=40960 effective
    samples. Guarantees the sample mean of inputs is exactly 0.
 
 4. **Layer fold at layers 30–31** — for always-on neurons, compute
@@ -21,7 +21,11 @@ It combines four key ideas:
 
 5. **Exact layer-0 formula** — E[ReLU(x^T w)] = ||w|| / sqrt(2π) when x ~ N(0,I).
 
-Score: adjusted_final_layer_score ≈ 3.31e-07 on the grader.
+6. **Dead-neuron correction** — instead of predicting 0 for dead neurons,
+   use the analytical E[ReLU(z)] = μΦ(α) + σφ(α) from diagonal propagation.
+   This eliminates the systematic underestimation bias (free in FLOPs).
+
+Score: N=40960 targets the leaderboard-proven budget-used regime.
 """
 
 from __future__ import annotations
@@ -33,9 +37,9 @@ import flopscope.numpy as fnp
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
-_MAIN_SAMPLES = 16384  # 8192 Sobol half-samples × 2 (antithetic)
-_DEAD_THRESH = -2.5
-_ON_THRESH = 2.5
+_MAIN_SAMPLES = 40960  # 20480 Sobol half-samples × 2 (antithetic)
+_DEAD_THRESH = -3.0
+_ON_THRESH = 3.0
 
 
 def _scatter(values, idx, width):
@@ -58,7 +62,7 @@ class Estimator(BaseEstimator):
         fnp.random.default_rng(ctx.seed)
         sobol_path = Path(ctx.submission_dir) / "sobol_points.npz"
         data = fnp.load(str(sobol_path))
-        self._sobol_points = data["points"]  # (8192, 256) float32
+        self._sobol_points = data["points"]  # (n_half_samples, 256) float32
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width = mlp.width
@@ -74,6 +78,7 @@ class Estimator(BaseEstimator):
         active_indices = []
         kink_indices = []
         on_indices = []
+        dead_corrections = []  # analytical E[ReLU] for dead neurons (instead of 0)
         mu_post = fnp.zeros(width)
         var_post = fnp.zeros(width)
 
@@ -92,6 +97,7 @@ class Estimator(BaseEstimator):
             # Classify
             dead_mask = alpha < _DEAD_THRESH
             on_mask = alpha > _ON_THRESH
+            dead_idx = fnp.nonzero(dead_mask)[0]
             active_indices.append(fnp.nonzero(~dead_mask)[0])
             kink_indices.append(fnp.nonzero((~dead_mask) & (~on_mask))[0])
             on_indices.append(fnp.nonzero(on_mask)[0])
@@ -102,6 +108,12 @@ class Estimator(BaseEstimator):
             mu_post = mu_pre * Phi + sigma_pre * phi
             var_post = (var_pre + mu_pre * mu_pre) * Phi + mu_pre * sigma_pre * phi - mu_post * mu_post
             var_post = fnp.maximum(var_post, 1e-12)
+
+            # Dead-neuron correction: analytical E[ReLU] instead of 0
+            if len(dead_idx) > 0:
+                dead_corrections.append(_scatter(mu_post[dead_idx], dead_idx, width))
+            else:
+                dead_corrections.append(fnp.zeros(width))
 
         # =================================================================
         # Stage 2: Sobol MC through active subnetwork + fold at layers 30–31
@@ -197,12 +209,13 @@ class Estimator(BaseEstimator):
 
         # =================================================================
         # Stage 3: Assemble output — exact layer 0, MC for layers 1–31
+        # Add dead-neuron analytical corrections at each layer.
         # =================================================================
         w0 = mlp.weights[0]
         sigma_0 = fnp.sqrt(fnp.maximum(fnp.sum(w0 * w0, axis=0), 1e-12))
         row0 = sigma_0 * fnp.float32(0.3989422804014327)  # ||w_j|| × φ(0)
 
-        rows = [row0] + mc_rows[1:]
+        rows = [row0 + dead_corrections[0]] + [mc_rows[l] + dead_corrections[l] for l in range(1, len(mc_rows))]
         return fnp.stack(rows, axis=0)
 
 

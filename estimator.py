@@ -14,7 +14,7 @@ import flopscope.numpy as fnp
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
-_MAIN_SAMPLES = 16384  # 8192 Sobol half-samples × 2 (antithetic)
+_MAIN_SAMPLES = 40960  # 20480 Sobol half-samples × 2 (antithetic)
 
 
 def _scatter(values, idx, width):
@@ -46,7 +46,7 @@ class Estimator(BaseEstimator):
         # Load pre-computed Sobol N(0,1) points (generated offline with scipy)
         sobol_path = Path(ctx.submission_dir) / "sobol_points.npz"
         data = fnp.load(str(sobol_path))
-        self._sobol_points = data["points"]  # (8192, 256) float32
+        self._sobol_points = data["points"]  # (n_half_samples, 256) float32
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         _ = budget
@@ -61,14 +61,15 @@ class Estimator(BaseEstimator):
         # =================================================================
         # Stage 1: Analytical classification (no pilot — saves ~2.7B FLOPs)
         # Propagate mean/variance through layers to compute α = μ/σ
-        # α < -2.5 → dead, α > 2.5 → always-on, else → kink (needs MC)
+        # α < -3.0 → dead, α > 3.0 → always-on, else → kink (needs MC)
         # =================================================================
-        _DEAD_THRESH = -2.5
-        _ON_THRESH = 2.5
+        _DEAD_THRESH = -3.0
+        _ON_THRESH = 3.0
 
         active_indices = []
         kink_indices = []
         on_indices = []
+        dead_corrections = []  # analytical E[ReLU] for dead neurons (instead of 0)
         anal_mu_post = fnp.zeros(width)   # post-ReLU mean (analytical)
         anal_var_post = fnp.zeros(width)  # post-ReLU variance (analytical)
 
@@ -93,6 +94,7 @@ class Estimator(BaseEstimator):
             on_mask = alpha > _ON_THRESH
             kink_mask = (~dead_mask) & (~on_mask)
 
+            dead_idx = fnp.nonzero(dead_mask)[0]
             active_indices.append(fnp.nonzero(~dead_mask)[0])
             kink_indices.append(fnp.nonzero(kink_mask)[0])
             on_indices.append(fnp.nonzero(on_mask)[0])
@@ -105,11 +107,17 @@ class Estimator(BaseEstimator):
             anal_var_post = (var_pre + mu_pre * mu_pre) * Phi + mu_pre * sigma_pre * phi - anal_mu_post * anal_mu_post
             anal_var_post = fnp.maximum(anal_var_post, 1e-12)
 
+            # Dead-neuron correction: use analytical E[ReLU] instead of 0
+            if len(dead_idx) > 0:
+                dead_corrections.append(_scatter(anal_mu_post[dead_idx], dead_idx, width))
+            else:
+                dead_corrections.append(fnp.zeros(width))
+
         # =================================================================
         # Stage 2: Main MC with pre-computed Sobol points + fold at layer 30
         # =================================================================
-        # Use shipped Sobol points (4096 half-samples) + antithetic pairing = 8192
-        half = fnp.array(self._sobol_points[:, :width])
+        # Use shipped Sobol half-samples + antithetic pairing.
+        half = fnp.array(self._sobol_points[: _MAIN_SAMPLES // 2, :width])
         x_main = fnp.concatenate([half, -half], axis=0)
         mc_rows = []
         mc_vars = []
@@ -232,7 +240,9 @@ class Estimator(BaseEstimator):
         var_pre_0 = fnp.sum(w0 * w0, axis=0)
         sigma_pre_0 = fnp.sqrt(fnp.maximum(var_pre_0, 1e-12))
         row0 = sigma_pre_0 * fnp.float32(0.3989422804014327)  # σ × φ(0)
-        rows = [row0] + mc_rows[1:]
+
+        # Assemble output: MC rows + dead-neuron analytical corrections
+        rows = [row0 + dead_corrections[0]] + [mc_rows[l] + dead_corrections[l] for l in range(1, len(mc_rows))]
 
         return fnp.stack(rows, axis=0)
 

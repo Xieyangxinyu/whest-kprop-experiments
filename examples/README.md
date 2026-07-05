@@ -12,11 +12,11 @@ Read in order. Each file is a complete, runnable Stage 1 estimator.
 | [11_antithetic_monte_carlo_sampling.py](11_antithetic_monte_carlo_sampling.py) | intermediate | x/−x Gaussian input pairs for variance reduction at no extra FLOP cost |
 | [12_active_set_sampling.py](12_active_set_sampling.py) | advanced | Pilot pass discovers sparse live layers, then main sampling runs on the active subnetwork |
 | [13_sobol_active_set_fold.py](13_sobol_active_set_fold.py) | advanced | Sobol QMC + analytical classification + layer fold |
-| [14_two_ended_layer30_refinement.py](14_two_ended_layer30_refinement.py) | **best** | Current best family: two-ended layer-30 pilot refinement on top of Sobol active-set folding |
+| [14_two_ended_layer30_refinement.py](14_two_ended_layer30_refinement.py) | **best** | Current best family: layer-29 plus layer-30 borderline pilot refinement on top of Sobol active-set folding |
 
 The main `estimator.py` builds on these ideas: analytical classification (02) replaces the pilot,
 Sobol QMC points shipped as `.npz` (04) replace pseudo-random samples, antithetic pairing (11)
-doubles effective N, active-set pruning (12) focuses FLOPs on live neurons, and two-ended
+doubles effective N, active-set pruning (12) focuses FLOPs on live neurons, and layer-29/30
 late-layer refinement (14) corrects borderline Stage 1 classifications.
 
 ## Run any example

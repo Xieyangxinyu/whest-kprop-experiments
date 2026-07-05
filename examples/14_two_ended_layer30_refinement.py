@@ -1,15 +1,19 @@
-"""Two-ended layer-30 refinement for the Sobol active-set estimator.
+"""Layer-29 plus layer-30 borderline refinement for Sobol active-set MC.
 
-This is the current best submission family after submission 314954. It starts
-from the Sobol active-set fold estimator and adds a small layer-30 pilot that
-refines Stage 1 classification in both safe directions:
+This is the current best submission family after submission 314957.
+It starts from Sobol active-set folding and uses a small 5% pilot from the
+same samples to refine borderline Stage 1 classifications:
 
-1. Demote weak always-on neurons back to kink when pilot alpha is not confident.
-2. Promote weak dead neurons back to kink when pilot alpha suggests they are not
-   confidently dead.
+1. Layer 29: promote borderline dead neurons back to kink.
+2. Layer 30: demote borderline always-on neurons back to kink.
+3. Layer 30: promote borderline dead neurons back to kink.
 
-The pilot reuses the same Sobol samples used by the final estimate. It only adds
-probe FLOPs for the refinement decision.
+Only borderline neurons are probed:
+- on-neurons with analytical alpha in [3, 4]
+- dead-neurons with analytical alpha in [-4, -3]
+
+The pilot rows are reused in the final estimate; the only extra cost is the
+probe matmuls used to refine the classification.
 """
 
 from __future__ import annotations
@@ -27,6 +31,8 @@ _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.05
 _PILOT_ON_THRESH = 3.0
 _PILOT_DEAD_THRESH = -2.5
+_ON_PROBE_MAX = 4.0
+_DEAD_PROBE_MIN = -4.0
 
 
 def _scatter(values, idx, width):
@@ -35,7 +41,7 @@ def _scatter(values, idx, width):
 
 
 class Estimator(BaseEstimator):
-    """Sobol QMC + analytical classification + two-ended layer-30 refinement."""
+    """Sobol QMC + analytical classification + layer-29/30 pilot refinement."""
 
     def __init__(self) -> None:
         self._sobol_points = None
@@ -60,6 +66,7 @@ class Estimator(BaseEstimator):
         dead_indices = []
         dead_corrections = []
         analytical_rows = []
+        alpha_rows = []
         mu_post = fnp.zeros(width)
         var_post = fnp.zeros(width)
 
@@ -80,6 +87,7 @@ class Estimator(BaseEstimator):
             kink_mask = (~dead_mask) & (~on_mask)
 
             dead_idx = fnp.nonzero(dead_mask)[0]
+            alpha_rows.append(alpha)
             dead_indices.append(dead_idx)
             active_indices.append(fnp.nonzero(~dead_mask)[0])
             kink_indices.append(fnp.nonzero(kink_mask)[0])
@@ -122,39 +130,54 @@ class Estimator(BaseEstimator):
                 x_before_fold = x
                 pilot_rows = max(2, min(_MAIN_SAMPLES, int(_MAIN_SAMPLES * _PILOT_FRACTION)))
 
-                w_on_probe = w[prev_idx, :][:, on_idx]
-                pre_on_pilot = x[:pilot_rows, :] @ w_on_probe
-                pilot_mean = fnp.mean(pre_on_pilot, axis=0)
-                pilot_var = fnp.var(pre_on_pilot, axis=0)
-                pilot_alpha = pilot_mean / fnp.sqrt(fnp.maximum(pilot_var, 1e-12))
+                on_probe_mask = alpha_rows[layer_idx][on_idx] <= fnp.float32(_ON_PROBE_MAX)
+                trusted_on_idx = on_idx[~on_probe_mask]
+                probe_on_idx = on_idx[on_probe_mask]
+                if len(probe_on_idx) > 0:
+                    w_on_probe = w[prev_idx, :][:, probe_on_idx]
+                    pre_on_pilot = x[:pilot_rows, :] @ w_on_probe
+                    pilot_mean = fnp.mean(pre_on_pilot, axis=0)
+                    pilot_var = fnp.var(pre_on_pilot, axis=0)
+                    pilot_alpha = pilot_mean / fnp.sqrt(fnp.maximum(pilot_var, 1e-12))
 
-                on_np = on_idx.astype(int)
-                kink_np = kink_idx.astype(int)
-                keep_on = pilot_alpha > fnp.float32(_PILOT_ON_THRESH)
-                demoted_np = on_np[~keep_on]
-                on_idx = on_np[keep_on]
-                kink_idx = fnp.sort(fnp.concatenate([kink_np, demoted_np]))
+                    keep_on = pilot_alpha > fnp.float32(_PILOT_ON_THRESH)
+                    demoted_idx = probe_on_idx[~keep_on]
+                    kept_probe_on_idx = probe_on_idx[keep_on]
+                else:
+                    demoted_idx = on_idx[:0]
+                    kept_probe_on_idx = on_idx[:0]
+
+                on_idx = fnp.sort(fnp.concatenate([trusted_on_idx, kept_probe_on_idx]))
+                kink_idx = fnp.sort(fnp.concatenate([kink_idx, demoted_idx]))
                 on_indices[layer_idx] = on_idx
                 kink_indices[layer_idx] = kink_idx
 
                 dead_idx = dead_indices[layer_idx]
                 if len(dead_idx) > 0:
-                    w_dead_probe = w[prev_idx, :][:, dead_idx]
-                    pre_dead_pilot = x[:pilot_rows, :] @ w_dead_probe
-                    dead_mean = fnp.mean(pre_dead_pilot, axis=0)
-                    dead_var = fnp.var(pre_dead_pilot, axis=0)
-                    dead_alpha = dead_mean / fnp.sqrt(fnp.maximum(dead_var, 1e-12))
+                    dead_probe_mask = alpha_rows[layer_idx][dead_idx] >= fnp.float32(_DEAD_PROBE_MIN)
+                    trusted_dead_idx = dead_idx[~dead_probe_mask]
+                    probe_dead_idx = dead_idx[dead_probe_mask]
+                    if len(probe_dead_idx) > 0:
+                        w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
+                        pre_dead_pilot = x[:pilot_rows, :] @ w_dead_probe
+                        dead_mean = fnp.mean(pre_dead_pilot, axis=0)
+                        dead_var = fnp.var(pre_dead_pilot, axis=0)
+                        dead_alpha = dead_mean / fnp.sqrt(fnp.maximum(dead_var, 1e-12))
 
-                    dead_np = dead_idx.astype(int)
-                    promote_dead = dead_alpha > fnp.float32(_PILOT_DEAD_THRESH)
-                    promoted_np = dead_np[promote_dead]
-                    remaining_dead_np = dead_np[~promote_dead]
-                    if len(promoted_np) > 0:
+                        promote_dead = dead_alpha > fnp.float32(_PILOT_DEAD_THRESH)
+                        promoted_idx = probe_dead_idx[promote_dead]
+                        remaining_probe_dead_idx = probe_dead_idx[~promote_dead]
+                    else:
+                        promoted_idx = dead_idx[:0]
+                        remaining_probe_dead_idx = dead_idx[:0]
+
+                    remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
+                    if len(promoted_idx) > 0:
                         dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
-                            analytical_rows[layer_idx][promoted_np], promoted_np, width
+                            analytical_rows[layer_idx][promoted_idx], promoted_idx, width
                         )
-                    dead_indices[layer_idx] = remaining_dead_np
-                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_np]))
+                    dead_indices[layer_idx] = remaining_dead_idx
+                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_idx]))
                     idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
                     kink_indices[layer_idx] = kink_idx
                     active_indices[layer_idx] = idx
@@ -206,6 +229,39 @@ class Estimator(BaseEstimator):
                 prev_idx = idx
                 x_before_fold = None
                 continue
+
+            if layer_idx == 29 and prev_idx is not None:
+                dead_idx = dead_indices[layer_idx]
+                if len(dead_idx) > 0:
+                    pilot_rows = max(2, min(_MAIN_SAMPLES, int(_MAIN_SAMPLES * _PILOT_FRACTION)))
+                    dead_probe_mask = alpha_rows[layer_idx][dead_idx] >= fnp.float32(_DEAD_PROBE_MIN)
+                    trusted_dead_idx = dead_idx[~dead_probe_mask]
+                    probe_dead_idx = dead_idx[dead_probe_mask]
+
+                    if len(probe_dead_idx) > 0:
+                        w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
+                        pre_dead_pilot = x[:pilot_rows, :] @ w_dead_probe
+                        dead_mean = fnp.mean(pre_dead_pilot, axis=0)
+                        dead_var = fnp.var(pre_dead_pilot, axis=0)
+                        dead_alpha = dead_mean / fnp.sqrt(fnp.maximum(dead_var, 1e-12))
+
+                        promote_dead = dead_alpha > fnp.float32(_PILOT_DEAD_THRESH)
+                        promoted_idx = probe_dead_idx[promote_dead]
+                        remaining_probe_dead_idx = probe_dead_idx[~promote_dead]
+                    else:
+                        promoted_idx = dead_idx[:0]
+                        remaining_probe_dead_idx = dead_idx[:0]
+
+                    remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
+                    if len(promoted_idx) > 0:
+                        dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
+                            analytical_rows[layer_idx][promoted_idx], promoted_idx, width
+                        )
+                    dead_indices[layer_idx] = remaining_dead_idx
+                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_idx]))
+                    idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
+                    kink_indices[layer_idx] = kink_idx
+                    active_indices[layer_idx] = idx
 
             if prev_idx is None:
                 w_active = w[:, idx]

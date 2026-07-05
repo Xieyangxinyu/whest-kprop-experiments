@@ -21,6 +21,7 @@ Current best public direction:
 - Layer-30 fold skips confident on neurons.
 - Dead-neuron analytical correction is added back.
 - Submission `314954` added two-ended layer-30 refinement and improved public score slightly to `2.27e-7`.
+- Submission `314957` added layer-29 borderline dead refinement on top of layer-30 borderline refinement and improved public score to `2.25e-7`.
 
 Important negative results:
 - `49152` samples used too much compute and was worse on leaderboard.
@@ -152,12 +153,12 @@ Initial stance:
 
 ## Immediate Next Step
 
-Implement instrumentation in `eval_variants.py` for the two-ended layer-30 pilot:
-- print average demotions/promotions per variant
-- optionally print per-seed counts
-- compare current all-probe variant against borderline-only probing
+Next candidate should refine earlier dead-neuron gates conservatively, starting from the leaderboard-confirmed layer-29 + layer-30 probe:
+- at layer 29, probe dead-neurons with analytical alpha in `[-4.0, -3.0]` and promote to kink if pilot alpha `> -2.5`
+- at layer 30, probe on-neurons with analytical alpha in `[3.0, 4.0]` and demote to kink if pilot alpha `<= 3.0`
+- at layer 30, probe dead-neurons with analytical alpha in `[-4.0, -3.0]` and promote to kink if pilot alpha `> -2.5`
 
-Then update this plan with the observed counts and the next decision.
+Rationale: local validation improved over layer-30-only borderline refinement on both seed groups while probing only about `40-45` total columns, and submission `314957` confirmed a small public improvement.
 
 ## Iteration Log
 
@@ -165,4 +166,11 @@ Then update this plan with the observed counts and the next decision.
 
 - Created plan after submission `314954` improved to public score `2.27e-7`.
 - Current best direction is two-ended Stage 1 refinement, not sample-count scaling or QMC seed tuning.
-- Next experiment should make the layer-30 pilot cheaper or more targeted before another submission.
+- Instrumented `eval_variants.py` with layer-30 demotion/promotion counts.
+- All-probe two-ended refinement changed about `5` on-neurons and `0.8-1.0` dead-neurons on average, but probed about `158-164` columns.
+- Borderline-only `4/-4` refinement changed nearly the same useful neurons while probing only about `26-29` columns, and was best or tied-best on both local seed groups.
+- Isolated probes suggest the dead-side correction carries most of the raw-MSE gain; on-side still adds a small extra improvement when combined.
+- Tested dead refinement further back than layer 30. Layer-29 + layer-30 borderline refinement was consistently better than layer-30-only on both seed groups (`5.530e-7` vs `5.550e-7`; `2.756e-7` vs `2.784e-7`).
+- Wider dead-only windows were unstable: `l24-30` was best on seeds `5..9` but much worse on seeds `0..4`, so do not submit that without stronger evidence.
+- Current next candidate is `l29+30 borderline 4/-4`; avoid layer-31 refinement for now because it repeatedly regressed.
+- Submission `314957` confirmed `l29+30 borderline 4/-4` on the public leaderboard: adjusted score `2.25e-7`, final-layer MSE `4.94e-7`, budget used `45.82%`.

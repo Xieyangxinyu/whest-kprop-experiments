@@ -72,6 +72,7 @@ class Estimator(BaseEstimator):
         dead_indices = []
         dead_corrections = []  # analytical E[ReLU] for dead neurons (instead of 0)
         analytical_rows = []
+        alpha_rows = []
         anal_mu_post = fnp.zeros(width)   # post-ReLU mean (analytical)
         anal_var_post = fnp.zeros(width)  # post-ReLU variance (analytical)
 
@@ -97,6 +98,7 @@ class Estimator(BaseEstimator):
             kink_mask = (~dead_mask) & (~on_mask)
 
             dead_idx = fnp.nonzero(dead_mask)[0]
+            alpha_rows.append(alpha)
             dead_indices.append(dead_idx)
             active_indices.append(fnp.nonzero(~dead_mask)[0])
             kink_indices.append(fnp.nonzero(kink_mask)[0])
@@ -152,39 +154,54 @@ class Estimator(BaseEstimator):
 
                 pilot_rows = max(2, min(_MAIN_SAMPLES, int(_MAIN_SAMPLES * 0.05)))
 
-                w_on_probe = w[prev_idx, :][:, on_idx]
-                pre_on_pilot = x_main[:pilot_rows, :] @ w_on_probe
-                pilot_mean = fnp.mean(pre_on_pilot, axis=0)
-                pilot_var = fnp.var(pre_on_pilot, axis=0)
-                pilot_alpha = pilot_mean / fnp.sqrt(fnp.maximum(pilot_var, 1e-12))
+                on_probe_mask = alpha_rows[layer_idx][on_idx] <= fnp.float32(4.0)
+                trusted_on_idx = on_idx[~on_probe_mask]
+                probe_on_idx = on_idx[on_probe_mask]
+                if len(probe_on_idx) > 0:
+                    w_on_probe = w[prev_idx, :][:, probe_on_idx]
+                    pre_on_pilot = x_main[:pilot_rows, :] @ w_on_probe
+                    pilot_mean = fnp.mean(pre_on_pilot, axis=0)
+                    pilot_var = fnp.var(pre_on_pilot, axis=0)
+                    pilot_alpha = pilot_mean / fnp.sqrt(fnp.maximum(pilot_var, 1e-12))
 
-                on_np = on_idx.astype(int)
-                kink_np = kink_idx.astype(int)
-                keep_on = pilot_alpha > fnp.float32(3.0)
-                demoted_np = on_np[~keep_on]
-                on_idx = on_np[keep_on]
-                kink_idx = fnp.sort(fnp.concatenate([kink_np, demoted_np]))
+                    keep_on = pilot_alpha > fnp.float32(3.0)
+                    demoted_idx = probe_on_idx[~keep_on]
+                    kept_probe_on_idx = probe_on_idx[keep_on]
+                else:
+                    demoted_idx = on_idx[:0]
+                    kept_probe_on_idx = on_idx[:0]
+
+                on_idx = fnp.sort(fnp.concatenate([trusted_on_idx, kept_probe_on_idx]))
+                kink_idx = fnp.sort(fnp.concatenate([kink_idx, demoted_idx]))
                 on_indices[layer_idx] = on_idx
                 kink_indices[layer_idx] = kink_idx
 
                 dead_idx = dead_indices[layer_idx]
                 if len(dead_idx) > 0:
-                    w_dead_probe = w[prev_idx, :][:, dead_idx]
-                    pre_dead_pilot = x_main[:pilot_rows, :] @ w_dead_probe
-                    dead_pilot_mean = fnp.mean(pre_dead_pilot, axis=0)
-                    dead_pilot_var = fnp.var(pre_dead_pilot, axis=0)
-                    dead_pilot_alpha = dead_pilot_mean / fnp.sqrt(fnp.maximum(dead_pilot_var, 1e-12))
+                    dead_probe_mask = alpha_rows[layer_idx][dead_idx] >= fnp.float32(-4.0)
+                    trusted_dead_idx = dead_idx[~dead_probe_mask]
+                    probe_dead_idx = dead_idx[dead_probe_mask]
+                    if len(probe_dead_idx) > 0:
+                        w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
+                        pre_dead_pilot = x_main[:pilot_rows, :] @ w_dead_probe
+                        dead_pilot_mean = fnp.mean(pre_dead_pilot, axis=0)
+                        dead_pilot_var = fnp.var(pre_dead_pilot, axis=0)
+                        dead_pilot_alpha = dead_pilot_mean / fnp.sqrt(fnp.maximum(dead_pilot_var, 1e-12))
 
-                    dead_np = dead_idx.astype(int)
-                    promote_dead = dead_pilot_alpha > fnp.float32(-2.5)
-                    promoted_np = dead_np[promote_dead]
-                    remaining_dead_np = dead_np[~promote_dead]
-                    if len(promoted_np) > 0:
+                        promote_dead = dead_pilot_alpha > fnp.float32(-2.5)
+                        promoted_idx = probe_dead_idx[promote_dead]
+                        remaining_probe_dead_idx = probe_dead_idx[~promote_dead]
+                    else:
+                        promoted_idx = dead_idx[:0]
+                        remaining_probe_dead_idx = dead_idx[:0]
+
+                    remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
+                    if len(promoted_idx) > 0:
                         dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
-                            analytical_rows[layer_idx][promoted_np], promoted_np, width
+                            analytical_rows[layer_idx][promoted_idx], promoted_idx, width
                         )
-                    dead_indices[layer_idx] = remaining_dead_np
-                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_np]))
+                    dead_indices[layer_idx] = remaining_dead_idx
+                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_idx]))
                     idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
                     kink_indices[layer_idx] = kink_idx
                     active_indices[layer_idx] = idx
@@ -255,6 +272,40 @@ class Estimator(BaseEstimator):
                 prev_idx = idx
                 x_before_fold = None
                 continue
+
+            # --- Layer 29: promote borderline dead neurons before the layer-30 fold ---
+            if layer_idx == 29 and prev_idx is not None:
+                dead_idx = dead_indices[layer_idx]
+                if len(dead_idx) > 0:
+                    pilot_rows = max(2, min(_MAIN_SAMPLES, int(_MAIN_SAMPLES * 0.05)))
+                    dead_probe_mask = alpha_rows[layer_idx][dead_idx] >= fnp.float32(-4.0)
+                    trusted_dead_idx = dead_idx[~dead_probe_mask]
+                    probe_dead_idx = dead_idx[dead_probe_mask]
+
+                    if len(probe_dead_idx) > 0:
+                        w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
+                        pre_dead_pilot = x_main[:pilot_rows, :] @ w_dead_probe
+                        dead_pilot_mean = fnp.mean(pre_dead_pilot, axis=0)
+                        dead_pilot_var = fnp.var(pre_dead_pilot, axis=0)
+                        dead_pilot_alpha = dead_pilot_mean / fnp.sqrt(fnp.maximum(dead_pilot_var, 1e-12))
+
+                        promote_dead = dead_pilot_alpha > fnp.float32(-2.5)
+                        promoted_idx = probe_dead_idx[promote_dead]
+                        remaining_probe_dead_idx = probe_dead_idx[~promote_dead]
+                    else:
+                        promoted_idx = dead_idx[:0]
+                        remaining_probe_dead_idx = dead_idx[:0]
+
+                    remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
+                    if len(promoted_idx) > 0:
+                        dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
+                            analytical_rows[layer_idx][promoted_idx], promoted_idx, width
+                        )
+                    dead_indices[layer_idx] = remaining_dead_idx
+                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_idx]))
+                    idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
+                    kink_indices[layer_idx] = kink_idx
+                    active_indices[layer_idx] = idx
 
             # --- Standard active-set forward ---
             if prev_idx is None:

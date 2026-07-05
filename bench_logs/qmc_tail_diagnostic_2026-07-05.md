@@ -83,6 +83,37 @@ estimator via eval_variants.py (the fold machinery may interact), (3)
 account for the added cost (~5.4 GFLOP rotation matmul + SVD, ~2% of
 budget). Treat as sample-geometry tuning — the exact category that has
 overfit locally before.
+
+## Rotation Inside eval_variants.py (same day, final)
+
+Added `rotate_w0` variants to `eval_variants.py` (W0-SVD rotation of the
+Sobol half-points, rotation matmul flopscope-tracked; the SVD itself ran
+untracked, so real cost is slightly higher than shown). Champion config
+`l29+30 borderline 4/-4` with and without rotation, both seed groups.
+
+At N_SAMPLES=16384 (diagnostic scale): rotation wins clearly.
+- seeds 0-4: score 2.86e-7 vs 3.30e-7 (rot better, -13%)
+- seeds 5-9: score 2.95e-7 vs 3.22e-7 (rot better, -8%)
+
+At N_SAMPLES=40960 (submission scale): rotation LOSES.
+- seeds 0-4: score 5.15e-7 vs 5.10e-7 (rot worse; raw final MSE slightly
+  better, 1.152e-6 vs 1.166e-6, but +1% util eats it)
+- seeds 5-9: score 3.13e-7 vs 2.66e-7 (rot clearly worse, raw final MSE
+  worse too: 6.97e-7 vs 6.04e-7)
+
+This is the same signature as sphere/radial sampling: helps at 16384,
+loses at 40960. The likely mechanism: the shipped Sobol net's later
+coordinates are good enough at 40960 points that rotation's realignment
+no longer buys variance, while on seeds 5-9 it actively hurts (rotation
+changes which 256 of the point set's coordinates are used, effectively a
+different sample draw — seed-level luck, not structure). All-layers MSE
+improves with rotation at both scales, but the leaderboard scores only
+the final layer.
+
+DECISION: reject W0-SVD rotation for the 40960-sample submission config.
+Do not retry without evidence at submission scale. This closes out the
+last surviving idea from the external QMC review — all of its proposals
+are now measured rejects for this regime.
 - Worth a cheap test: RQMC-style scramble replicates only as an error-bar
   diagnostic offline, not in the submission (samples are budget-capped).
 - Reinforces: keep investing in borderline dead/on refinement — that is

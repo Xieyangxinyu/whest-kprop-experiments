@@ -28,6 +28,8 @@ BUDGET = 272_000_000_000
 N_SAMPLES = int(os.environ.get("N_SAMPLES", "16384"))
 GT_SAMPLES = int(os.environ.get("GT_SAMPLES", "300000"))
 SEEDS = tuple(int(seed) for seed in os.environ.get("SEEDS", "0,1,2,3,4").split(",") if seed)
+# Comma-separated substrings; when set, only variants whose name contains one of them run.
+VARIANT_FILTER = tuple(s for s in os.environ.get("VARIANT_FILTER", "").split(",") if s)
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class Variant:
     refine_dead_probe_min: float = -4.0
     dead_scale: float = 1.0
     final_analytical_blend: float = 0.0
+    rotate_w0: bool = False
 
 
 VARIANTS = (
@@ -72,6 +75,13 @@ VARIANTS = (
     Variant("pilot dead l24-30 border -4", on_thresh=3.00, refine_dead_layers=(24, 25, 26, 27, 28, 29), refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_dead_probe_min=-4.00),
     Variant("pilot l28-30 + on30", on_thresh=3.00, refine_dead_layers=(28, 29), refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00),
     Variant("pilot l27-30 + on30", on_thresh=3.00, refine_dead_layers=(27, 28, 29), refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00),
+    Variant("l29+30 border 8% pilot", on_thresh=3.00, refine_layer29_dead=True, refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.08, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00),
+    Variant("l29+30 border 10% pilot", on_thresh=3.00, refine_layer29_dead=True, refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.10, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00),
+    Variant("l29+30 border + blend 0.05", on_thresh=3.00, refine_layer29_dead=True, refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00, final_analytical_blend=0.05),
+    Variant("l29+30 border + blend 0.10", on_thresh=3.00, refine_layer29_dead=True, refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00, final_analytical_blend=0.10),
+    Variant("l29+30 border + blend 0.20", on_thresh=3.00, refine_layer29_dead=True, refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00, final_analytical_blend=0.20),
+    Variant("rot-w0 fold-on 3.00", on_thresh=3.00, rotate_w0=True),
+    Variant("rot-w0 l29+30 borderline 4/-4", on_thresh=3.00, refine_layer29_dead=True, refine_layer30_on=True, refine_layer30_dead=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00, refine_dead_thresh=-2.50, refine_borderline_only=True, refine_on_probe_max=4.00, refine_dead_probe_min=-4.00, rotate_w0=True),
     Variant("pilot refine l31 5%/3.0", on_thresh=3.00, refine_layer31_on=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00),
     Variant("pilot refine l30+31 5%", on_thresh=3.00, refine_layer30_on=True, refine_layer31_on=True, refine_pilot_fraction=0.05, refine_on_thresh=3.00),
     Variant("pilot refine l30 25%/3.0", on_thresh=3.00, refine_layer30_on=True, refine_pilot_fraction=0.25, refine_on_thresh=3.00),
@@ -204,6 +214,12 @@ def predict_variant(mlp, sobol_points, variant: Variant):
             dead_corrections.append(fnp.zeros(width))
 
     half = fnp.array(sobol_points[:n_pairs, :width])
+    if variant.rotate_w0:
+        # Gaussian rotation invariance: align the first (highest-quality) Sobol
+        # coordinates with W0's top left-singular directions. SVD runs outside
+        # flopscope on raw NumPy; in a submission this cost would need tracking.
+        u_rot, _, _ = np.linalg.svd(np.asarray(mlp.weights[0], dtype=np.float64))
+        half = half @ fnp.array(u_rot.T.astype(np.float32))
     sample_scale = fnp.float32(1.0)
     if variant.sample_mode == "sphere":
         norm = fnp.sqrt(fnp.maximum(fnp.sum(half * half, axis=1, keepdims=True), 1e-12))
@@ -528,8 +544,12 @@ def evaluate():
         gt = np.asarray(monte_carlo_layer_means(mlp, GT_SAMPLES, seed=seed + 10_000))
         cases.append((seed, mlp, gt))
 
+    variants = VARIANTS
+    if VARIANT_FILTER:
+        variants = tuple(v for v in VARIANTS if any(s in v.name for s in VARIANT_FILTER))
+
     results = []
-    for variant in VARIANTS:
+    for variant in variants:
         final_mses = []
         all_mses = []
         flops_used = []

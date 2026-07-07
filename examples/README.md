@@ -12,12 +12,14 @@ Read in order. Each file is a complete, runnable Stage 1 estimator.
 | [11_antithetic_monte_carlo_sampling.py](11_antithetic_monte_carlo_sampling.py) | intermediate | x/−x Gaussian input pairs for variance reduction at no extra FLOP cost |
 | [12_active_set_sampling.py](12_active_set_sampling.py) | advanced | Pilot pass discovers sparse live layers, then main sampling runs on the active subnetwork |
 | [13_sobol_active_set_fold.py](13_sobol_active_set_fold.py) | advanced | Sobol QMC + analytical classification + layer fold |
-| [14_two_ended_layer30_refinement.py](14_two_ended_layer30_refinement.py) | **best** | Current best family: layer-29 plus layer-30 borderline pilot refinement on top of Sobol active-set folding |
+| [14_two_ended_layer30_refinement.py](14_two_ended_layer30_refinement.py) | advanced | Previous best family: layer-29 plus layer-30 borderline pilot refinement on top of Sobol active-set folding |
+| [15_dynamic_allocation.py](15_dynamic_allocation.py) | **best** | Algorithm 15 / submission 315123: staged all-layer classification refinement plus smooth analytical-variance allocation (`30720..61440`, anchor `49152`) |
+| [16_edgeworth_diagonal_moments.py](16_edgeworth_diagonal_moments.py) | research dead-end | Diagonal Edgeworth cumulant propagation probe; useful context, but not competitive as a submission path |
 
-The main `estimator.py` builds on these ideas: analytical classification (02) replaces the pilot,
-Sobol QMC points shipped as `.npz` (04) replace pseudo-random samples, antithetic pairing (11)
-doubles effective N, active-set pruning (12) focuses FLOPs on live neurons, and layer-29/30
-late-layer refinement (14) corrects borderline Stage 1 classifications.
+The main `estimator.py` is Algorithm 15. It builds on analytical classification (02),
+Sobol QMC points shipped as `.npz` (04), antithetic pairing (11), active-set pruning (12),
+layer-29/30 late-layer refinement (14), staged all-layer reclassification, and smooth
+variance-scaled continuation.
 
 ## Run any example
 

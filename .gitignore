@@ -31,6 +31,7 @@ Thumbs.db
 .claude/decision_log.jsonl
 .claude/plans/
 .claude/worktrees/
+.playwright-mcp/
 
 # Internal process docs (specs, plans, scratch) — not for participant repo.
 .aicrowd/

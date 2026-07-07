@@ -6,8 +6,17 @@
 # Version control / CI / envs
 .git/
 .github/
+.claude/
+.playwright-mcp/
 .venv/
 .python-version
+.aicrowd/
+.env
+.env.*
+*.key
+*.pem
+*token*
+*secret*
 
 # Caches & build artifacts
 __pycache__/
@@ -15,6 +24,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
+.tmp/
 
 # Local-iteration helpers — used by `python estimator.py`, NOT by the grader
 local_engine.py

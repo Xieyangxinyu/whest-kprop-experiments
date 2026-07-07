@@ -172,3 +172,12 @@
 - Leaderboard/public evidence: public adjusted score `2.037596606578937e-7`; final-layer MSE `3.72e-7`; all-layers MSE `8.164e-4`; budget used `53.93%`; mean effective compute `1.47e11`; `0/50` public failures.
 - Decision: keep as current best; accept bad all-layer MSE because the leaderboard scores only the final row.
 - Lesson: output-row bookkeeping was a real but small compute leak. Removing non-scored intermediate row materialization transfers when final sample propagation is unchanged.
+
+### Submission 315211 - Stale Diagnostic Return Cleanup
+
+- Result: regressed slightly.
+- Change: kept `315204` but removed an unused `_run_block()` diagnostic return value (`0.0`) and the ignored `final_anal_diff_mean` unpacking in `predict()`.
+- Local expectation: validation passed; subprocess seed `42`, `n=3` had adjusted `2.26e-7`, raw final-layer MSE `4.27e-7`, all-layers MSE `7.09e-4`, utilization `52.91%`, and `0/3` failures.
+- Leaderboard/public evidence: public adjusted score `2.0388509099332659e-7`; final-layer MSE `3.72e-7`; all-layers MSE `8.164e-4`; budget used `53.97%`; mean effective compute `1.47e11`; `0/50` public failures. Worse than `315204` (`2.037596606578937e-7`).
+- Decision: reject and restore the `315204` estimator surface.
+- Lesson: micro-cleanups that change only Python return/unpack shape can still move residual/effective compute noise the wrong way; require leaderboard confirmation before keeping them.

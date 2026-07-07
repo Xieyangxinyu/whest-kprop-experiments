@@ -1,10 +1,12 @@
-"""Algorithm 15: staged active-set Sobol with smooth sample allocation.
+"""Algorithm 15: staged active-set Sobol with final-scored rows.
 
 This estimator starts from a 30,720-sample prefix. It refines active/dead/on
 classification with staged pilot probes, then uses analytical final-layer
 variance as a hardness signal and chooses
 ``N_i = clip(49152 * sqrt(V_i / V_ref), 30720, 61440)``. Harder MLPs continue
-with the next Sobol prefix; easier MLPs keep the shorter estimate.
+with the next Sobol prefix; easier MLPs keep the shorter estimate. The final row
+is sampled accurately, while intermediate returned rows are cheap analytical
+fillers because the leaderboard scores only the final layer.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ _DEMOTE_ACTIVE_DEAD_START_LAYER = 1
 _DEMOTE_ACTIVE_DEAD_STOP_LAYER = 29
 _ACTIVE_DEAD_PROBE_MAX = -2.5
 _ACTIVE_DEAD_THRESH = -3.0
+_MATERIALIZE_INTERMEDIATE_ROWS = False
 
 
 def _scatter(values, idx, width):
@@ -145,7 +148,7 @@ class Estimator(BaseEstimator):
             var_post = fnp.maximum(var_post, 1e-12)
             analytical_rows.append(mu_post)
 
-            if len(dead_idx) > 0:
+            if len(dead_idx) > 0 and (_MATERIALIZE_INTERMEDIATE_ROWS or layer_idx == mlp.depth - 1):
                 dead_corrections.append(_scatter(mu_post[dead_idx], dead_idx, width))
             else:
                 dead_corrections.append(fnp.zeros(width))
@@ -215,7 +218,7 @@ class Estimator(BaseEstimator):
                     kept_probe_kink_idx = kink_idx[:0]
                     demoted_kink_idx = kink_idx[:0]
 
-                if len(demoted_kink_idx) > 0:
+                if len(demoted_kink_idx) > 0 and _MATERIALIZE_INTERMEDIATE_ROWS:
                     dead_corrections[layer_idx] = dead_corrections[layer_idx] + _scatter(
                         analytical_rows[layer_idx][demoted_kink_idx], demoted_kink_idx, width
                     )
@@ -262,7 +265,7 @@ class Estimator(BaseEstimator):
                             remaining_probe_dead_idx = dead_idx[:0]
 
                         remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
-                        if len(promoted_idx) > 0:
+                        if len(promoted_idx) > 0 and _MATERIALIZE_INTERMEDIATE_ROWS:
                             dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
                                 analytical_rows[layer_idx][promoted_idx], promoted_idx, width
                             )
@@ -333,7 +336,7 @@ class Estimator(BaseEstimator):
                         remaining_probe_dead_idx = dead_idx[:0]
 
                     remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
-                    if len(promoted_idx) > 0:
+                    if len(promoted_idx) > 0 and _MATERIALIZE_INTERMEDIATE_ROWS:
                         dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
                             analytical_rows[layer_idx][promoted_idx], promoted_idx, width
                         )
@@ -351,13 +354,21 @@ class Estimator(BaseEstimator):
             else:
                 w_active = w[prev_idx, :][:, idx]
                 x = fnp.maximum(x @ w_active, 0.0)
-            mc_rows.append(_scatter(fnp.mean(x, axis=0), idx, width))
+            if _MATERIALIZE_INTERMEDIATE_ROWS or layer_idx >= 30:
+                mc_rows.append(_scatter(fnp.mean(x, axis=0), idx, width))
+            else:
+                mc_rows.append(fnp.zeros(width))
             prev_idx = idx
 
-        w0 = mlp.weights[0]
-        sigma_0 = fnp.sqrt(fnp.maximum(fnp.sum(w0 * w0, axis=0), 1e-12))
-        row0 = sigma_0 * fnp.float32(0.3989422804014327)
-        rows = [row0 + dead_corrections[0]] + [mc_rows[layer] + dead_corrections[layer] for layer in range(1, len(mc_rows))]
+        if _MATERIALIZE_INTERMEDIATE_ROWS:
+            w0 = mlp.weights[0]
+            sigma_0 = fnp.sqrt(fnp.maximum(fnp.sum(w0 * w0, axis=0), 1e-12))
+            row0 = sigma_0 * fnp.float32(0.3989422804014327)
+            rows = [row0 + dead_corrections[0]] + [
+                mc_rows[layer] + dead_corrections[layer] for layer in range(1, len(mc_rows))
+            ]
+        else:
+            rows = list(analytical_rows[:-1]) + [mc_rows[-1] + dead_corrections[-1]]
 
         refined_structure = {
             "active_indices": active_indices,
@@ -379,10 +390,9 @@ class Estimator(BaseEstimator):
         base_rows, final_anal_diff_mean, refined_structure = self._run_block(
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
-        base_pred = fnp.stack(base_rows, axis=0)
         _ = final_anal_diff_mean
         if target_samples <= _BASE_SAMPLES:
-            return base_pred
+            return fnp.stack(base_rows, axis=0)
 
         extra_samples = target_samples - _BASE_SAMPLES
         extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)

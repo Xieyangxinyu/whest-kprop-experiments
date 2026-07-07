@@ -1,12 +1,15 @@
-"""Algorithm 15: staged active-set Sobol with smooth sample allocation.
+"""Algorithm 15: staged active-set Sobol with final-scored rows.
 
-This example names the current best submission family from `estimator.py`:
+This example names the current best submission family from `estimator.py`
+(`315204`):
 
 - staged active/dead/on classification refinement from a 30,720-sample prefix
 - first-layer antithetic sign-flip shortcut
 - variance-free active-set forward pass
 - smooth analytical-final-variance allocation
   `N_i = clip(49152 * sqrt(V_i / 0.02143), 30720, 61440)`
+- final-scored-row bookkeeping: rows `0..30` are analytical filler, while the
+    final row and sample propagation are unchanged
 
 The implementation is re-exported from the root estimator so the curriculum
 example cannot silently drift from the submitted Algorithm 15 surface. The

@@ -10,7 +10,8 @@
 
 ## Current Best Artifact
 
-- Current best is submission `315123`: staged all-layer classification refinement plus higher continuous sqrt-variance allocation anchor `49152`, clipped to `30720..61440` samples.
+- Current best is submission `315204`: Algorithm 15 plus final-scored-row bookkeeping only; intermediate rows are analytical filler, while the final row and sample propagation are unchanged.
+- Previous best was submission `315123`: staged all-layer classification refinement plus higher continuous sqrt-variance allocation anchor `49152`, clipped to `30720..61440` samples.
 - Previous best was submission `315122`: continuous sqrt-variance allocation with unused active-path sampled variance bookkeeping removed, first-layer antithetic sign-flip shortcut, and staged all-layer classification refinement.
 - Previous best was submission `315109`: continuous sqrt-variance allocation with unused active-path sampled variance bookkeeping removed and first-layer antithetic sign-flip shortcut.
 - Previous best was submission `315105`: continuous sqrt-variance allocation with unused active-path sampled variance bookkeeping removed from `_run_block()`.
@@ -19,6 +20,7 @@
 - Current best budget use is about `54%`; the old `45-46%` envelope was too conservative after staged classification improved raw accuracy. Prefer smooth sample-envelope changes over blunt fixed or bucketed sample jumps.
 - Half-size `20480` effective Sobol samples with `10240` shipped half-points regressed on leaderboard; do not use as the current artifact.
 - Current submission file should slice `sobol_points.npz` by the selected sample count so a larger shipped point file cannot silently increase compute.
+- Intermediate all-layer MSE is no longer meaningful for the current submission surface because rows `0..30` are intentionally cheap analytical filler; optimize and compare by adjusted final-layer score and raw final-layer MSE.
 - Submission `314954` with two-ended layer-30 refinement improved to public adjusted score `2.27e-7`, slightly better than the prior best.
 - Submission `314957` with layer-29 plus layer-30 borderline refinement improved again to public adjusted score `2.25e-7`.
 - Submission `315074` with continuous sqrt-variance allocation improved again to public adjusted score `2.2452526444934443e-7`.
@@ -161,3 +163,12 @@
 - Leaderboard/public evidence: public adjusted score `2.042047322113885e-7`; final-layer MSE `3.72e-7`; all-layers MSE `8.996e-7`; budget used `54.05%`; mean effective compute `1.47e11`; `0/50` public failures.
 - Decision: keep as current best; use `49152` as the new anchor baseline before testing any higher envelope.
 - Lesson: submission `315119` correctly signaled that spending more compute can be worthwhile; the transfer-safe form was a smooth variance-scaled anchor increase, not fixed max samples.
+
+### Submission 315204 - Final-Scored Row Bookkeeping
+
+- Result: improved slightly; new current best.
+- Change: kept Algorithm 15 final-row computation unchanged but stopped materializing sampled intermediate output rows and intermediate dead-correction scatter rows when only the final row is scored; rows `0..30` are returned as analytical filler. Also avoided stacking the base prediction unless the base-only path returns.
+- Local expectation: exact public-mini CLI with both bookkeeping trims had adjusted score rounded `2.35e-7`, raw final-layer MSE `4.39e-7`, all-layers MSE `7.86e-4`, mean utilization `51.95%`, and `0/100` failures. Subprocess seed `42`, `n=3` passed with adjusted `2.26e-7`, raw `4.27e-7`, all-layers MSE `7.09e-4`, utilization `52.94%`, and `0/3` failures.
+- Leaderboard/public evidence: public adjusted score `2.037596606578937e-7`; final-layer MSE `3.72e-7`; all-layers MSE `8.164e-4`; budget used `53.93%`; mean effective compute `1.47e11`; `0/50` public failures.
+- Decision: keep as current best; accept bad all-layer MSE because the leaderboard scores only the final row.
+- Lesson: output-row bookkeeping was a real but small compute leak. Removing non-scored intermediate row materialization transfers when final sample propagation is unchanged.

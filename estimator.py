@@ -1,4 +1,4 @@
-"""Algorithm 15: staged active-set Sobol with final-scored rows.
+"""Algorithm 16: argpartition packed row-sparse active propagation.
 
 This estimator starts from a 30,720-sample prefix. It refines active/dead/on
 classification with staged pilot probes, then uses analytical final-layer
@@ -7,6 +7,12 @@ variance as a hardness signal and chooses
 with the next Sobol prefix; easier MLPs keep the shorter estimate. The final row
 is sampled accurately, while intermediate returned rows are cheap analytical
 fillers because the leaderboard scores only the final layer.
+
+Compared with Algorithm 15, the base/refinement sample block uses an exact
+row-sparse active propagation path for ordinary active layers. It packs each
+row's nonzero activations with `fnp.argpartition` and contracts the packed rows
+with gathered dense weight rows. Extra continuation blocks stay dense to preserve
+the wall-time-safe behavior confirmed by submission 315416.
 """
 
 from __future__ import annotations
@@ -40,6 +46,14 @@ _DEMOTE_ACTIVE_DEAD_STOP_LAYER = 29
 _ACTIVE_DEAD_PROBE_MAX = -2.5
 _ACTIVE_DEAD_THRESH = -3.0
 _MATERIALIZE_INTERMEDIATE_ROWS = False
+_PACKED_ROWSPARSE = True
+_PACKED_ROWSPARSE_START_LAYER = 1
+_PACKED_ROWSPARSE_STOP_LAYER = 29
+_PACKED_ROWSPARSE_CHUNK_ROWS = 2048
+_PACKED_ROWSPARSE_BUCKET = 16
+_PACKED_ROWSPARSE_MAX_K_NUM = 3
+_PACKED_ROWSPARSE_MAX_K_DEN = 4
+_PACKED_ROWSPARSE_EXTRA_BLOCKS = False
 
 
 def _scatter(values, idx, width):
@@ -88,6 +102,48 @@ def _staged_threshold_split(source_idx, x, weights, n_samples: int, threshold: f
     above_idx = fnp.concatenate([stable_above_idx, uncertain_idx[recheck_above_mask]])
     below_idx = fnp.concatenate([stable_below_idx, uncertain_idx[~recheck_above_mask]])
     return fnp.sort(above_idx), fnp.sort(below_idx)
+
+
+def _ceil_bucket(value: int, bucket: int, limit: int) -> int:
+    bucketed = ((value + bucket - 1) // bucket) * bucket
+    return min(limit, max(0, bucketed))
+
+
+def _packed_matmul(x, weights):
+    n_rows = x.shape[0]
+    prev_width = weights.shape[0]
+    out_width = weights.shape[1]
+    chunks = []
+
+    for start in range(0, n_rows, _PACKED_ROWSPARSE_CHUNK_ROWS):
+        stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
+        x_chunk = x[start:stop, :]
+        chunk_rows = stop - start
+
+        nnz_per_row = fnp.sum(x_chunk > fnp.float32(0.0), axis=1)
+        max_nnz = int(fnp.max(nnz_per_row))
+        if max_nnz == 0:
+            chunks.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
+            continue
+
+        k = _ceil_bucket(max_nnz, _PACKED_ROWSPARSE_BUCKET, prev_width)
+        if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
+            chunks.append(x_chunk @ weights)
+            continue
+
+        order = fnp.argpartition(x_chunk == fnp.float32(0.0), k - 1, axis=1)[:, :k]
+        values = fnp.take_along_axis(x_chunk, order, axis=1)
+        gathered_weights = fnp.take(weights, order, axis=0)
+        pre = fnp.einsum("nk,nko->no", values, gathered_weights)
+        chunks.append(pre)
+
+    if len(chunks) == 1:
+        return chunks[0]
+    return fnp.concatenate(chunks, axis=0)
+
+
+def _packed_relu_matmul(x, weights):
+    return fnp.maximum(_packed_matmul(x, weights), 0.0)
 
 
 class Estimator(BaseEstimator):
@@ -353,7 +409,14 @@ class Estimator(BaseEstimator):
                 x = fnp.concatenate([fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0)], axis=0)
             else:
                 w_active = w[prev_idx, :][:, idx]
-                x = fnp.maximum(x @ w_active, 0.0)
+                if (
+                    _PACKED_ROWSPARSE
+                    and (refine or _PACKED_ROWSPARSE_EXTRA_BLOCKS)
+                    and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
+                ):
+                    x = _packed_relu_matmul(x, w_active)
+                else:
+                    x = fnp.maximum(x @ w_active, 0.0)
             if _MATERIALIZE_INTERMEDIATE_ROWS or layer_idx >= 30:
                 mc_rows.append(_scatter(fnp.mean(x, axis=0), idx, width))
             else:

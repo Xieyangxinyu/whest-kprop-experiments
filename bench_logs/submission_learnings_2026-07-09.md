@@ -2,8 +2,8 @@
 
 ## Current Decision
 
-- Current best is submission `315521`: Algorithm 17 block-split packed row-sparse with guarded Strassen dense sampled matmuls.
-- Public score: `1.4895563350388822e-7`; raw final MSE: `3.724955968209542e-7`.
+- Current best is submission `315527`: Algorithm 17 block-split packed row-sparse with guarded Strassen dense sampled matmuls, row-bucketed packed residuals, and chunk `16384`.
+- Public score: `1.4048840986673e-7`; raw final MSE: `3.724917345948597e-7`.
 - Safe fallback is submission `315416`: Algorithm 16 argpartition base-block packed row-sparse (`1.8089072203069811e-7`).
 - Submission `315512` hand-built early-layer schedule and submission `315515` fixed `0.85` threshold both regressed and should not be retried.
 
@@ -124,3 +124,37 @@
 - Local evidence: first-5 public-mini with Strassen threshold `0.75` worsened from adjusted `1.575469150647e-7`, mean effective `97.84G` to adjusted `1.785511969058e-7`, mean effective `110.14G`. The guard reduced `argpartition` calls (`953` to `533`) and `einsum` FLOPs (`171.23G` to `63.07G`) but increased dense `matmul` FLOPs (`262.49G` to `446.25G`).
 - Decision: do not submit; revert the guard.
 - Lesson: the generic 10-15% sparse-density rule does not transfer directly to this packed activation kernel; even moderately sparse packed chunks can beat dense-Strassen in charged FLOPs.
+
+### Submission 315525 - Row-Bucketed Packed Sparse Residual
+
+- Result: improved; new current best.
+- Change: starts from `315521` and changes `_packed_matmul` to sort rows by per-row NNZ within each chunk, process NNZ bucket bands with smaller packed widths, then restore row order. This keeps exact sample alignment for layer-30/31 fold paths while reducing over-padding of sparse rows.
+- Local expectation: first-5 public-mini improved adjusted score from `1.575469150647e-7` to `1.444132897510e-7`; first-10 improved from `1.607992476973e-7` to `1.536014257562e-7`; first-36 improved from `1.794391039294e-7` to `1.685026362984e-7`. First-36 had `0/36` failures, no budget/time/combined/residual exhaustion, max wall `11.74s` vs `17.39s` for `315521` local, and max residual `0.209s`.
+- Leaderboard/public evidence: public score `1.472692953072472e-7`, score secondary/raw final MSE `3.7249093708169313e-7`, inferred multiplier `0.39536343209056046`; graded successfully and improved over `315521` (`1.4895563350388822e-7`).
+- Decision: keep as current best.
+- Lesson: row bucketing reduced charged `einsum` FLOPs and `take` backend time despite extra `argsort`/grouping overhead; this is the first MKL/cuSPARSE-inspired sparse-structure idea that transferred remotely.
+
+### Local Probe - Coarse Row Buckets `(0, 32, 64, 128, 192)`
+
+- Result: regressed locally; reverted.
+- Change: coarsened `_PACKED_ROWSPARSE_ROW_BUCKETS` from `(0, 16, 32, 64, 96, 128, 192)` to `(0, 32, 64, 128, 192)` to reduce group count and overhead.
+- Local evidence: first-10 public-mini regressed from adjusted `1.536014257562e-7`, mean effective `88.76G` to adjusted `1.602682687169e-7`, mean effective `92.74G`. Coarser buckets reduced `argpartition` calls (`4372` to `3014`) but increased `einsum` FLOPs (`270.53G` to `296.78G`) and `take` backend time (`35.35s` to `46.25s`).
+- Decision: revert to fine buckets.
+- Lesson: for this row-bucketed kernel, the finer bands are worth their extra grouping overhead because they reduce padded packed contractions and gather pressure.
+
+### Submission 315527 - Row-Bucketed Chunk 16384
+
+- Result: improved; new current best.
+- Change: starts from `315525` and increases `_PACKED_ROWSPARSE_CHUNK_ROWS` from `8192` to `16384` while keeping fine row buckets `(0, 16, 32, 64, 96, 128, 192)`.
+- Local expectation: first-10 public-mini was nearly tied on adjusted (`1.536207131616e-7` vs `1.536014257562e-7`) but improved mean effective compute (`87.69G` vs `88.76G`). First-36 improved adjusted score from `1.685026362984e-7` to `1.648107268681e-7` and mean effective compute from `96.33G` to `94.63G`; `0/36` failures, no budget/time/combined/residual exhaustion, max wall `13.99s`, max residual `0.223s`.
+- Leaderboard/public evidence: public score `1.4048840986673e-7`, score secondary/raw final MSE `3.724917345948597e-7`, inferred multiplier `0.3771584623737546`; graded successfully and improved over `315525` (`1.472692953072472e-7`).
+- Decision: keep as current best and freeze this surface before further experiments.
+- Lesson: larger chunks transferred strongly with row bucketing; lower overhead/effective compute outweighed the local max-wall increase.
+
+### Local Probe - Chunk 16384 Strassen Min Rows 8192
+
+- Result: inconclusive/weak; reverted.
+- Change: on top of row-bucket chunk `16384`, raised `_DENSE_STRASSEN_MIN_ROWS` from `4096` to `8192` to avoid Strassen overhead on smaller dense grouped calls.
+- Local evidence: first-10 adjusted improved slightly from `1.536207131616e-7` to `1.530091591958e-7`, but mean effective compute worsened from `87.69G` to `89.08G` and residual increased. Raw final MSE also shifted slightly from floating-order changes.
+- Decision: do not stress/submit this exact threshold; revert to `_DENSE_STRASSEN_MIN_ROWS = 4096`.
+- Lesson: the dense-Strassen threshold is not an obvious win after row bucketing; prioritize row-kernel structure and chunk/bucket schedules.

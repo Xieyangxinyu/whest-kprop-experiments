@@ -52,8 +52,9 @@ _MATERIALIZE_INTERMEDIATE_ROWS = False
 _PACKED_ROWSPARSE = True
 _PACKED_ROWSPARSE_START_LAYER = 1
 _PACKED_ROWSPARSE_STOP_LAYER = 29
-_PACKED_ROWSPARSE_CHUNK_ROWS = 8192
+_PACKED_ROWSPARSE_CHUNK_ROWS = 16384
 _PACKED_ROWSPARSE_BUCKET = 16
+_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 16, 32, 64, 96, 128, 192)
 _PACKED_ROWSPARSE_MAX_K_NUM = 3
 _PACKED_ROWSPARSE_MAX_K_DEN = 4
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
@@ -204,16 +205,42 @@ def _packed_matmul(x, weights):
             chunks.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
             continue
 
-        k = _ceil_bucket(max_nnz, _PACKED_ROWSPARSE_BUCKET, prev_width)
-        if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
-            chunks.append(_dense_matmul(x_chunk, weights))
-            continue
+        row_order = fnp.argsort(nnz_per_row)
+        x_sorted = fnp.take(x_chunk, row_order, axis=0)
+        sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
+        sorted_chunks = []
+        group_start = 0
+        bucket_limits = list(_PACKED_ROWSPARSE_ROW_BUCKETS) + [prev_width]
+        for limit in bucket_limits:
+            if limit > prev_width:
+                continue
+            group_stop = int(fnp.sum(sorted_nnz <= limit))
+            if group_stop <= group_start:
+                continue
 
-        order = fnp.argpartition(x_chunk == fnp.float32(0.0), k - 1, axis=1)[:, :k]
-        values = fnp.take_along_axis(x_chunk, order, axis=1)
-        gathered_weights = fnp.take(weights, order, axis=0)
-        pre = fnp.einsum("nk,nko->no", values, gathered_weights)
-        chunks.append(pre)
+            x_group = x_sorted[group_start:group_stop, :]
+            group_rows = group_stop - group_start
+            if limit == 0:
+                sorted_chunks.append(fnp.zeros((group_rows, out_width), dtype=fnp.float32))
+            else:
+                k = _ceil_bucket(limit, _PACKED_ROWSPARSE_BUCKET, prev_width)
+                if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
+                    sorted_chunks.append(_dense_matmul(x_group, weights))
+                else:
+                    order = fnp.argpartition(x_group == fnp.float32(0.0), k - 1, axis=1)[:, :k]
+                    values = fnp.take_along_axis(x_group, order, axis=1)
+                    gathered_weights = fnp.take(weights, order, axis=0)
+                    sorted_chunks.append(fnp.einsum("nk,nko->no", values, gathered_weights))
+
+            group_start = group_stop
+            if group_start == chunk_rows:
+                break
+
+        if group_start < chunk_rows:
+            sorted_chunks.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
+
+        pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
+        chunks.append(fnp.take(pre_sorted, fnp.argsort(row_order), axis=0))
 
     if len(chunks) == 1:
         return chunks[0]

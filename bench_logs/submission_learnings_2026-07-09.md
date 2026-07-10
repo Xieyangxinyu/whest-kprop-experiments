@@ -2,8 +2,8 @@
 
 ## Current Decision
 
-- Current best is submission `315527`: Algorithm 17 block-split packed row-sparse with guarded Strassen dense sampled matmuls, row-bucketed packed residuals, and chunk `16384`.
-- Public score: `1.4048840986673e-7`; raw final MSE: `3.724917345948597e-7`.
+- Current best is submission `315541`: Algorithm 17 block-split packed row-sparse with guarded Strassen dense sampled matmuls, finer row-bucketed packed residuals, and chunk `16384`.
+- Public score: `1.400065882034336e-7`; raw final MSE: `3.724925954884384e-7`.
 - Safe fallback is submission `315416`: Algorithm 16 argpartition base-block packed row-sparse (`1.8089072203069811e-7`).
 - Submission `315512` hand-built early-layer schedule and submission `315515` fixed `0.85` threshold both regressed and should not be retried.
 
@@ -158,3 +158,28 @@
 - Local evidence: first-10 adjusted improved slightly from `1.536207131616e-7` to `1.530091591958e-7`, but mean effective compute worsened from `87.69G` to `89.08G` and residual increased. Raw final MSE also shifted slightly from floating-order changes.
 - Decision: do not stress/submit this exact threshold; revert to `_DENSE_STRASSEN_MIN_ROWS = 4096`.
 - Lesson: the dense-Strassen threshold is not an obvious win after row bucketing; prioritize row-kernel structure and chunk/bucket schedules.
+
+### Local Probe - Row-Bucketed Chunk 32768
+
+- Result: mixed/risky; reverted.
+- Change: increased `_PACKED_ROWSPARSE_CHUNK_ROWS` from `16384` to `32768` on top of the row-bucketed surface.
+- Local evidence: first-10 adjusted improved slightly from `1.536207131616e-7` to `1.522311140701e-7`, but mean effective compute worsened from `87.69G` to `88.88G`; wall time rose from `88.36s` to `115.57s`, max wall from `13.72s` to `16.70s`, and take backend rose from `40.80s` to `61.16s`.
+- Decision: do not stress/submit; revert to chunk `16384`.
+- Lesson: chunk `32768` over-amortizes grouping and increases gather/backend pressure too much, even when adjusted first-10 is slightly better.
+
+### Local Probe - Row-Bucketed Chunk 24576
+
+- Result: regressed on stress; reverted.
+- Change: tested intermediate `_PACKED_ROWSPARSE_CHUNK_ROWS = 24576` between current `16384` and rejected `32768`.
+- Local evidence: first-10 looked mildly promising (`1.531969115551e-7` vs `1.536207131616e-7`, mean effective `87.09G` vs `87.69G`), but first-36 regressed from adjusted `1.648107268681e-7`, mean effective `94.63G` to adjusted `1.676842453008e-7`, mean effective `96.48G`; max wall rose from `13.99s` to `16.41s`, take backend from `133.85s` to `197.14s`.
+- Decision: do not submit; revert to chunk `16384`.
+- Lesson: chunk `16384` remains the best local stress tradeoff; larger chunks increase gather pressure on harder MLPs even when first-10 looks slightly better.
+
+### Submission 315541 - Finer Row Buckets
+
+- Result: improved; new current best.
+- Change: starts from `315527` and changes `_PACKED_ROWSPARSE_ROW_BUCKETS` from `(0, 16, 32, 64, 96, 128, 192)` to `(0, 8, 16, 32, 48, 64, 96, 128, 192)`.
+- Local expectation: first-10 improved adjusted from `1.536207131616e-7` to `1.500347123695e-7` and mean effective from `87.69G` to `86.62G`. First-36 improved adjusted from `1.648107268681e-7` to `1.626393924256e-7` and mean effective from `94.63G` to `93.11G`; `0/36` failures, no budget/time/combined/residual exhaustion, max wall `11.25s`, max residual `0.162s`.
+- Leaderboard/public evidence: public score `1.400065882034336e-7`, score secondary/raw final MSE `3.724925954884384e-7`, inferred multiplier `0.37586408400909865`; graded successfully and improved over `315527` (`1.4048840986673e-7`).
+- Decision: keep as current best.
+- Lesson: adding low/mid NNZ bucket boundaries reduced padded `einsum` enough to beat extra grouping overhead locally and transferred remotely, though the public gain was smaller than the local first-36 gain.

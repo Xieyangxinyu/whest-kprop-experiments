@@ -15,7 +15,7 @@ Read in order. Each file is a complete, runnable Stage 1 estimator.
 | [14_two_ended_layer30_refinement.py](14_two_ended_layer30_refinement.py) | advanced | Previous best family: layer-29 plus layer-30 borderline pilot refinement on top of Sobol active-set folding |
 | [15_dynamic_allocation.py](15_dynamic_allocation.py) | **best** | Algorithm 15 / submission 315204: staged all-layer classification, smooth analytical-variance allocation (`30720..61440`, anchor `49152`), and final-scored-row bookkeeping |
 | [16_argpartition_rowsparse.py](16_argpartition_rowsparse.py) | experimental | Algorithm 16 / submission 315416: exact argpartition-packed row-sparse active propagation on the base/refinement block, with dense continuation blocks for wall-time safety |
-| [17_strassen_rowsparse.py](17_strassen_rowsparse.py) | experimental | Algorithm 17 / submission 315527: block-split packed row-sparse sampled propagation, row-bucketed packed residuals, chunk `16384`, and guarded one-level Strassen for large dense sampled matmuls |
+| [17_strassen_rowsparse.py](17_strassen_rowsparse.py) | experimental | Algorithm 17 / submission 315541: block-split packed row-sparse sampled propagation, finer row-bucketed packed residuals, chunk `16384`, and guarded one-level Strassen for large dense sampled matmuls |
 
 The main `estimator.py` may be ahead of this curriculum during active experiments. The
 numbered examples preserve stable milestone surfaces: Algorithm 15 is the last pre-row-sparse

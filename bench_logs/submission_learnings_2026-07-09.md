@@ -2,8 +2,8 @@
 
 ## Current Decision
 
-- Current best is submission `315541`: Algorithm 17 block-split packed row-sparse with guarded Strassen dense sampled matmuls, finer row-bucketed packed residuals, and chunk `16384`.
-- Public score: `1.400065882034336e-7`; raw final MSE: `3.724925954884384e-7`.
+- Current best is submission `315640`: Algorithm 17 block-split packed row-sparse with guarded Strassen dense sampled matmuls, finer row-bucketed packed residuals including NNZ<=80, and chunk `16384`.
+- Public score: `1.3909393109948974e-7`; raw final MSE: `3.724983756114852e-7`.
 - Safe fallback is submission `315416`: Algorithm 16 argpartition base-block packed row-sparse (`1.8089072203069811e-7`).
 - Submission `315512` hand-built early-layer schedule and submission `315515` fixed `0.85` threshold both regressed and should not be retried.
 
@@ -183,3 +183,44 @@
 - Leaderboard/public evidence: public score `1.400065882034336e-7`, score secondary/raw final MSE `3.724925954884384e-7`, inferred multiplier `0.37586408400909865`; graded successfully and improved over `315527` (`1.4048840986673e-7`).
 - Decision: keep as current best.
 - Lesson: adding low/mid NNZ bucket boundaries reduced padded `einsum` enough to beat extra grouping overhead locally and transferred remotely, though the public gain was smaller than the local first-36 gain.
+
+### Contaminated Local Probes - Row-Kernel Variants After 315541
+
+- Result: inconclusive; do not use as evidence.
+- Cause: a local indentation error moved `chunks.append(fnp.take(pre_sorted, fnp.argsort(row_order), axis=0))` outside the `_packed_matmul` chunk loop. This silently changed predictions and caused raw final MSE jumps around `1.05e-6` in several later probes.
+- Affected probes: linear inverse row permutation, extra NNZ<=4 bucket, extra NNZ<=80 bucket, exact boolean argsort packing, searchsorted bucket boundaries, and fire threshold `0.50`.
+- Decision: estimator restored to the committed `315541` surface; rerun any of these ideas from the clean surface before accepting or rejecting them.
+- Lesson: local probes that should be algebraically exact must be checked against `git diff -- estimator.py` and raw final MSE; a repeated raw-MSE jump pattern usually means a code-path bug, not a real estimator tradeoff.
+
+### Local Probe - Clean Linear Inverse Row Permutation
+
+- Result: invalid/regressed; reverted.
+- Change: from clean `315541`, replaced `fnp.argsort(row_order)` used for row restore with `inverse_order = fnp.empty_like(row_order); inverse_order[row_order] = fnp.arange(chunk_rows)`.
+- Local evidence: first-10 raw final MSE worsened from `4.556152163104e-7` to `1.054465059269e-6` and adjusted regressed from `1.500347123695e-7` to `2.078906788708e-7`, despite much lower effective compute.
+- Decision: keep the transferred `fnp.argsort(row_order)` restore.
+- Lesson: flopscope indexed assignment is not a safe inverse-permutation primitive in this estimator path; avoid it.
+
+### Local Probe - Clean Searchsorted Row-Bucket Boundaries
+
+- Result: invalid/regressed; reverted.
+- Change: from clean `315541`, replaced `int(fnp.sum(sorted_nnz <= limit))` with `int(fnp.searchsorted(sorted_nnz, limit, side="right"))` for bucket boundaries.
+- Local evidence: first-10 raw final MSE worsened from `4.556152163104e-7` to `1.054465059269e-6` and adjusted regressed to `2.064810699584e-7`, despite lower effective compute.
+- Decision: keep the transferred `sum(sorted_nnz <= limit)` boundary logic.
+- Lesson: `fnp.searchsorted` is not equivalent enough in this estimator path; row-bucket boundary changes require full raw-MSE checks.
+
+### Local Probe - Clean Exact Boolean Argsort Packing
+
+- Result: invalid/regressed; reverted.
+- Change: from clean `315541`, replaced per-group boolean `argpartition` with boolean `argsort` before taking packed nonzero candidates.
+- Local evidence: first-10 raw final MSE worsened from `4.556152163104e-7` to `1.054459582406e-6` and adjusted regressed to `2.098799153441e-7`, despite much lower effective compute.
+- Decision: keep the transferred boolean `argpartition` packing path.
+- Lesson: boolean `argsort` is not a safe drop-in replacement for the transferred row-packing primitive in this estimator.
+
+### Submission 315640 - Finer Row Buckets plus NNZ<=80 Band
+
+- Result: improved; new current best.
+- Change: starts from `315541` and adds an intermediate `80` bucket: `(0, 8, 16, 32, 48, 64, 80, 96, 128, 192)`.
+- Local expectation: first-10 improved adjusted from `1.500347123695e-7` to `1.490205020657e-7`; first-36 improved from `1.626393924256e-7` to `1.616650205472e-7`. First-36 had `0/36` failures, no budget/time/combined/residual exhaustion, raw final MSE unchanged, max wall `11.81s`, max residual `0.195s`.
+- Leaderboard/public evidence: public score `1.3909393109948974e-7`, score secondary/raw final MSE `3.724983756114852e-7`, inferred multiplier `0.3734081547903563`; graded successfully and improved over `315541` (`1.400065882034336e-7`).
+- Decision: keep as current best.
+- Lesson: after fixing the contaminated indentation bug, the added `80` bucket is exact, locally positive, and transferred remotely.

@@ -46,3 +46,10 @@ eval_variants.py
 estimator_*_tmp.py
 bench_logs/
 submission-*.tar.gz
+
+# Local analysis caches & scratch (not needed by grader)
+.est*.npz
+*_cache.npz
+relu_moment_propagation.py
+prokpt.txt
+submission.tar.gz

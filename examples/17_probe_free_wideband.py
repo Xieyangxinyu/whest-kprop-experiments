@@ -242,6 +242,7 @@ class Estimator(BaseEstimator):
         candidates = [
             Path(ctx.submission_dir) / "sobol_points.npz",
             Path(__file__).resolve().parent / "sobol_points.npz",
+            Path(__file__).resolve().parent.parent / "sobol_points.npz",
         ]
         for sobol_path in candidates:
             if sobol_path.exists():
@@ -252,7 +253,7 @@ class Estimator(BaseEstimator):
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
-            data = fnp.load(str(Path(__file__).resolve().parent / "sobol_points.npz"))
+            data = fnp.load(str(Path(__file__).resolve().parent.parent / "sobol_points.npz"))
             self._sobol_points = data["points"]
 
     def _initial_structure(self, mlp: MLP, width: int) -> dict:
@@ -434,6 +435,9 @@ class Estimator(BaseEstimator):
 
 
 if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from local_engine import build_mlp, compare_against_monte_carlo
 
     mlp = build_mlp(width=256, depth=32, seed=0)

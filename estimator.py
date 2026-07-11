@@ -1,31 +1,26 @@
-"""Algorithm 18: probe-free wide-dead-band with finer antithetic row buckets.
+"""Algorithm 17: finer antithetic row buckets for block-split row-sparse propagation.
 
-Integration of the two independent Algorithm 17 lines:
+This estimator starts from a 30,720-sample prefix. It refines active/dead/on
+classification with staged pilot probes, then uses analytical final-layer
+variance as a hardness signal and chooses
+``N_i = clip(49152 * sqrt(V_i / V_ref), 30720, 61440)``. Harder MLPs continue
+with the next Sobol prefix; easier MLPs keep the shorter estimate. The final row
+is sampled accurately, while intermediate returned rows are cheap analytical
+fillers because the leaderboard scores only the final layer.
 
-1. Probe-free wide dead band (local line): removes the staged pilot-probe
-   machinery entirely and reallocates its compute into direct coverage; the
-   dead threshold widens from -3 to -4, so the borderline neurons the probes
-   used to rescue are simply kept sampled (bias protection by inclusion). The
-   on-side threshold stays at +3 because the always-on fold is linear-exact
-   and sampling those neurons buys nothing.
-2. Finer antithetic row buckets (submission 315824 line): row buckets
-   112/144/160/176 around the half-density antithetic layer-1 rows,
-   searchsorted bucket splits, empty_like row-order restore, and layer 1
-   routed directly to the packed matmul (antithetic layer-1 fire rates make
-   the dense/sparse column split useless there).
-
-Everything else (antithetic Sobol prefix, block-split packed row-sparse
-matmuls, guarded one-level Strassen, layer-30/31 fold, sqrt-hardness
-continuation) matches Algorithm 16 / submission 315718.
-
-Hypothesis under test (algorithm16_deep_dive.ipynb section 7b): probes cost
-~0.32% of budget plus per-layer Python residual and pay for themselves via 38
-demotions; this variant checks whether deleting their FLOPs + residual and
-paying ~+3-4% matmul width instead nets out positive on the adjusted score.
-Seed-42 n=3 subprocess A/B (2026-07-11): baseline adjusted 3.10e-7 (raw 4.27e-7);
-this variant (-4.0) scored 2.92e-7 (raw 3.96e-7); the -3.5 point 3.00e-7 (raw 4.05e-7).
-Seed-0 n=3: baseline 1.69e-7 (raw 2.46e-7); the -3.5 point 1.68e-7 (raw 2.40e-7).
-Seed-0 group and public-mini validation pending.
+Compared with the original argpartition row-sparse surface, sampled active
+propagation splits ordinary active matmuls into a dense high-fire block and a
+packed low-fire block. All samples still pass through exactly; the split only
+changes how the same sample-by-weight matmul is evaluated. The same split is
+used for both the base/refinement sample block and any extra continuation block.
+The special layer-30/31 fold from Algorithm 15 is kept, with block-split matmuls
+applied to its sampled kink paths. Large dense sampled matmuls use a guarded
+one-level Strassen contraction, while classification probes stay on plain dense
+matmul to avoid probe-path overhead.
+Submission 315718 added mask reuse and a `put_along_axis` row-order restore.
+Submission 315824 added finer row buckets around half-density antithetic layer-1
+rows (`112, 144, 160, 176`) as a submission-safe way to recover part of the
+rejected private antithetic pair-complement optimization.
 """
 
 from __future__ import annotations
@@ -43,8 +38,21 @@ _ANCHOR_SAMPLES = 49152
 _MAX_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
 _EASY_SAMPLES = 30720
 _VAR_REF = 0.02143
-_DEAD_THRESH = -4.0  # widened from -3.0: replaces the probe promote path by inclusion
+_DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
+_PILOT_FRACTION = 0.05
+_PILOT_RECHECK_FRACTION = 0.20
+_PILOT_RECHECK_MARGIN = 0.35
+_PILOT_ON_THRESH = 3.0
+_PILOT_DEAD_THRESH = -2.5
+_ON_PROBE_MAX = 4.0
+_DEAD_PROBE_MIN = -4.0
+_REFINE_DEAD_START_LAYER = 1
+_REFINE_DEAD_STOP_LAYER = 29
+_DEMOTE_ACTIVE_DEAD_START_LAYER = 1
+_DEMOTE_ACTIVE_DEAD_STOP_LAYER = 29
+_ACTIVE_DEAD_PROBE_MAX = -2.5
+_ACTIVE_DEAD_THRESH = -3.0
 _MATERIALIZE_INTERMEDIATE_ROWS = False
 _PACKED_ROWSPARSE = True
 _PACKED_ROWSPARSE_START_LAYER = 1
@@ -54,6 +62,7 @@ _PACKED_ROWSPARSE_BUCKET = 16
 _PACKED_ROWSPARSE_ROW_BUCKETS = (0, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
 _PACKED_ROWSPARSE_MAX_K_NUM = 3
 _PACKED_ROWSPARSE_MAX_K_DEN = 4
+_PACKED_ROWSPARSE_EXTRA_BLOCKS = True
 _BLOCK_SPLIT_ROWSPARSE = True
 _BLOCK_SPLIT_FIRE_THRESH = 0.75
 _BLOCK_SPLIT_MIN_DENSE_COLS = 32
@@ -73,6 +82,43 @@ def _choose_samples(final_var_mean: float) -> int:
     scaled = _ANCHOR_SAMPLES * math.sqrt(max(final_var_mean, 1e-30) / _VAR_REF)
     samples = int(round(scaled / 2.0) * 2)
     return max(_EASY_SAMPLES, min(_MAX_SAMPLES, samples))
+
+
+def _probe_rows(n_samples: int, fraction: float) -> int:
+    return max(2, min(n_samples, int(n_samples * fraction)))
+
+
+def _sample_alpha(x, weights, rows: int):
+    pre = x[:rows, :] @ weights
+    mean = fnp.mean(pre, axis=0)
+    var = fnp.var(pre, axis=0)
+    return mean / fnp.sqrt(fnp.maximum(var, 1e-12))
+
+
+def _staged_threshold_split(source_idx, x, weights, n_samples: int, threshold: float):
+    primary_rows = _probe_rows(n_samples, _PILOT_FRACTION)
+    primary_alpha = _sample_alpha(x, weights, primary_rows)
+    threshold_value = fnp.float32(threshold)
+    above_mask = primary_alpha > threshold_value
+
+    recheck_rows = _probe_rows(n_samples, _PILOT_RECHECK_FRACTION)
+    if recheck_rows <= primary_rows:
+        return source_idx[above_mask], source_idx[~above_mask]
+
+    uncertain_mask = fnp.abs(primary_alpha - threshold_value) <= fnp.float32(_PILOT_RECHECK_MARGIN)
+    uncertain_idx = source_idx[uncertain_mask]
+    if len(uncertain_idx) == 0:
+        return source_idx[above_mask], source_idx[~above_mask]
+
+    stable_mask = ~uncertain_mask
+    stable_above_idx = source_idx[above_mask & stable_mask]
+    stable_below_idx = source_idx[(~above_mask) & stable_mask]
+
+    recheck_alpha = _sample_alpha(x, weights[:, uncertain_mask], recheck_rows)
+    recheck_above_mask = recheck_alpha > threshold_value
+    above_idx = fnp.concatenate([stable_above_idx, uncertain_idx[recheck_above_mask]])
+    below_idx = fnp.concatenate([stable_below_idx, uncertain_idx[~recheck_above_mask]])
+    return fnp.sort(above_idx), fnp.sort(below_idx)
 
 
 def _ceil_bucket(value: int, bucket: int, limit: int) -> int:
@@ -242,23 +288,16 @@ def _block_split_relu_matmul(x, weights, layer_idx: int):
 
 
 class Estimator(BaseEstimator):
-    """Probe-free active-set sampling with a widened dead band."""
+    """Staged active-set refinement with smooth hard-network continuation."""
 
     def __init__(self) -> None:
         self._sobol_points = None
 
     def setup(self, ctx: SetupContext) -> None:
         fnp.random.default_rng(ctx.seed)
-        candidates = [
-            Path(ctx.submission_dir) / "sobol_points.npz",
-            Path(__file__).resolve().parent / "sobol_points.npz",
-        ]
-        for sobol_path in candidates:
-            if sobol_path.exists():
-                data = fnp.load(str(sobol_path))
-                self._sobol_points = data["points"]
-                return
-        raise FileNotFoundError("Could not find sobol_points.npz for Algorithm 17.")
+        sobol_path = Path(ctx.submission_dir) / "sobol_points.npz"
+        data = fnp.load(str(sobol_path))
+        self._sobol_points = data["points"]
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
@@ -269,8 +308,10 @@ class Estimator(BaseEstimator):
         active_indices = []
         kink_indices = []
         on_indices = []
+        dead_indices = []
         dead_corrections = []
         analytical_rows = []
+        alpha_rows = []
         mu_post = fnp.zeros(width)
         var_post = fnp.zeros(width)
 
@@ -291,6 +332,8 @@ class Estimator(BaseEstimator):
             kink_mask = (~dead_mask) & (~on_mask)
 
             dead_idx = fnp.nonzero(dead_mask)[0]
+            alpha_rows.append(alpha)
+            dead_indices.append(dead_idx)
             active_indices.append(fnp.nonzero(~dead_mask)[0])
             kink_indices.append(fnp.nonzero(kink_mask)[0])
             on_indices.append(fnp.nonzero(on_mask)[0])
@@ -311,8 +354,10 @@ class Estimator(BaseEstimator):
             "active_indices": active_indices,
             "kink_indices": kink_indices,
             "on_indices": on_indices,
+            "dead_indices": dead_indices,
             "dead_corrections": dead_corrections,
             "analytical_rows": analytical_rows,
+            "alpha_rows": alpha_rows,
             "final_var_mean": float(fnp.mean(var_post)),
         }
 
@@ -327,13 +372,15 @@ class Estimator(BaseEstimator):
         half = fnp.array(self._sobol_points[start_half:end_half, :width])
         return fnp.concatenate([half, -half], axis=0)
 
-    def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int) -> list:
+    def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
         width = mlp.width
-        active_indices = structure["active_indices"]
-        kink_indices = structure["kink_indices"]
-        on_indices = structure["on_indices"]
-        dead_corrections = structure["dead_corrections"]
+        active_indices = list(structure["active_indices"])
+        kink_indices = list(structure["kink_indices"])
+        on_indices = list(structure["on_indices"])
+        dead_indices = list(structure["dead_indices"])
+        dead_corrections = list(structure["dead_corrections"])
         analytical_rows = structure["analytical_rows"]
+        alpha_rows = structure["alpha_rows"]
 
         mc_rows = []
         prev_idx = None
@@ -351,8 +398,79 @@ class Estimator(BaseEstimator):
                 x_before_fold = None
                 continue
 
+            if (
+                refine
+                and prev_idx is not None
+                and _DEMOTE_ACTIVE_DEAD_START_LAYER <= layer_idx <= _DEMOTE_ACTIVE_DEAD_STOP_LAYER
+            ):
+                active_dead_probe_mask = alpha_rows[layer_idx][kink_idx] <= fnp.float32(_ACTIVE_DEAD_PROBE_MAX)
+                trusted_kink_idx = kink_idx[~active_dead_probe_mask]
+                probe_kink_idx = kink_idx[active_dead_probe_mask]
+                if len(probe_kink_idx) > 0:
+                    w_kink_probe = w[prev_idx, :][:, probe_kink_idx]
+                    kept_probe_kink_idx, demoted_kink_idx = _staged_threshold_split(
+                        probe_kink_idx, x, w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
+                    )
+                else:
+                    kept_probe_kink_idx = kink_idx[:0]
+                    demoted_kink_idx = kink_idx[:0]
+
+                if len(demoted_kink_idx) > 0 and _MATERIALIZE_INTERMEDIATE_ROWS:
+                    dead_corrections[layer_idx] = dead_corrections[layer_idx] + _scatter(
+                        analytical_rows[layer_idx][demoted_kink_idx], demoted_kink_idx, width
+                    )
+                    dead_indices[layer_idx] = fnp.sort(fnp.concatenate([dead_indices[layer_idx], demoted_kink_idx]))
+
+                kink_idx = fnp.sort(fnp.concatenate([trusted_kink_idx, kept_probe_kink_idx]))
+                idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
+                kink_indices[layer_idx] = kink_idx
+                active_indices[layer_idx] = idx
+
             if layer_idx == 30 and len(on_idx) > 0 and prev_idx is not None:
                 x_before_fold = x
+
+                if refine:
+                    on_probe_mask = alpha_rows[layer_idx][on_idx] <= fnp.float32(_ON_PROBE_MAX)
+                    trusted_on_idx = on_idx[~on_probe_mask]
+                    probe_on_idx = on_idx[on_probe_mask]
+                    if len(probe_on_idx) > 0:
+                        w_on_probe = w[prev_idx, :][:, probe_on_idx]
+                        kept_probe_on_idx, demoted_idx = _staged_threshold_split(
+                            probe_on_idx, x, w_on_probe, n_samples, _PILOT_ON_THRESH
+                        )
+                    else:
+                        demoted_idx = on_idx[:0]
+                        kept_probe_on_idx = on_idx[:0]
+
+                    on_idx = fnp.sort(fnp.concatenate([trusted_on_idx, kept_probe_on_idx]))
+                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, demoted_idx]))
+                    on_indices[layer_idx] = on_idx
+                    kink_indices[layer_idx] = kink_idx
+
+                    dead_idx = dead_indices[layer_idx]
+                    if len(dead_idx) > 0:
+                        dead_probe_mask = alpha_rows[layer_idx][dead_idx] >= fnp.float32(_DEAD_PROBE_MIN)
+                        trusted_dead_idx = dead_idx[~dead_probe_mask]
+                        probe_dead_idx = dead_idx[dead_probe_mask]
+                        if len(probe_dead_idx) > 0:
+                            w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
+                            promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
+                                probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                            )
+                        else:
+                            promoted_idx = dead_idx[:0]
+                            remaining_probe_dead_idx = dead_idx[:0]
+
+                        remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
+                        if len(promoted_idx) > 0 and _MATERIALIZE_INTERMEDIATE_ROWS:
+                            dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
+                                analytical_rows[layer_idx][promoted_idx], promoted_idx, width
+                            )
+                        dead_indices[layer_idx] = remaining_dead_idx
+                        kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_idx]))
+                        idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
+                        kink_indices[layer_idx] = kink_idx
+                        active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
                 x_kink = _block_split_relu_matmul(x, w_kink, layer_idx)
@@ -394,6 +512,37 @@ class Estimator(BaseEstimator):
                 x_before_fold = None
                 continue
 
+            if (
+                refine
+                and prev_idx is not None
+                and _REFINE_DEAD_START_LAYER <= layer_idx <= _REFINE_DEAD_STOP_LAYER
+            ):
+                dead_idx = dead_indices[layer_idx]
+                if len(dead_idx) > 0:
+                    dead_probe_mask = alpha_rows[layer_idx][dead_idx] >= fnp.float32(_DEAD_PROBE_MIN)
+                    trusted_dead_idx = dead_idx[~dead_probe_mask]
+                    probe_dead_idx = dead_idx[dead_probe_mask]
+
+                    if len(probe_dead_idx) > 0:
+                        w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
+                        promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
+                            probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                        )
+                    else:
+                        promoted_idx = dead_idx[:0]
+                        remaining_probe_dead_idx = dead_idx[:0]
+
+                    remaining_dead_idx = fnp.sort(fnp.concatenate([trusted_dead_idx, remaining_probe_dead_idx]))
+                    if len(promoted_idx) > 0 and _MATERIALIZE_INTERMEDIATE_ROWS:
+                        dead_corrections[layer_idx] = dead_corrections[layer_idx] - _scatter(
+                            analytical_rows[layer_idx][promoted_idx], promoted_idx, width
+                        )
+                    dead_indices[layer_idx] = remaining_dead_idx
+                    kink_idx = fnp.sort(fnp.concatenate([kink_idx, promoted_idx]))
+                    idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
+                    kink_indices[layer_idx] = kink_idx
+                    active_indices[layer_idx] = idx
+
             if prev_idx is None:
                 w_active = w[:, idx]
                 half_rows = n_samples // 2
@@ -401,7 +550,11 @@ class Estimator(BaseEstimator):
                 x = fnp.concatenate([fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0)], axis=0)
             else:
                 w_active = w[prev_idx, :][:, idx]
-                if _PACKED_ROWSPARSE and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER:
+                if (
+                    _PACKED_ROWSPARSE
+                    and (refine or _PACKED_ROWSPARSE_EXTRA_BLOCKS)
+                    and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
+                ):
                     if _BLOCK_SPLIT_ROWSPARSE:
                         x = _block_split_relu_matmul(x, w_active, layer_idx)
                     else:
@@ -418,33 +571,39 @@ class Estimator(BaseEstimator):
             w0 = mlp.weights[0]
             sigma_0 = fnp.sqrt(fnp.maximum(fnp.sum(w0 * w0, axis=0), 1e-12))
             row0 = sigma_0 * fnp.float32(0.3989422804014327)
-            return [row0 + dead_corrections[0]] + [
+            rows = [row0 + dead_corrections[0]] + [
                 mc_rows[layer] + dead_corrections[layer] for layer in range(1, len(mc_rows))
             ]
-        return list(analytical_rows[:-1]) + [mc_rows[-1] + dead_corrections[-1]]
+        else:
+            rows = list(analytical_rows[:-1]) + [mc_rows[-1] + dead_corrections[-1]]
+
+        refined_structure = {
+            "active_indices": active_indices,
+            "kink_indices": kink_indices,
+            "on_indices": on_indices,
+            "dead_indices": dead_indices,
+            "dead_corrections": dead_corrections,
+            "analytical_rows": analytical_rows,
+            "alpha_rows": alpha_rows,
+        }
+        return rows, refined_structure
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
-        _ = budget
         width = mlp.width
         structure = self._initial_structure(mlp, width)
         target_samples = _choose_samples(structure["final_var_mean"])
         base_x = self._sample_block(0, _BASE_SAMPLES // 2, width)
-        base_rows = self._run_block(mlp, structure, base_x, _BASE_SAMPLES)
+        base_rows, refined_structure = self._run_block(
+            mlp, structure, base_x, _BASE_SAMPLES, refine=True
+        )
         if target_samples <= _BASE_SAMPLES:
             return fnp.stack(base_rows, axis=0)
 
         extra_samples = target_samples - _BASE_SAMPLES
         extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
-        extra_rows = self._run_block(mlp, structure, extra_x, extra_samples)
+        extra_rows = self._run_block(mlp, refined_structure, extra_x, extra_samples, refine=False)[0]
         combined_rows = [
             (base_row * _BASE_SAMPLES + extra_row * extra_samples) / target_samples
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
         return fnp.stack(combined_rows, axis=0)
-
-
-if __name__ == "__main__":
-    from local_engine import build_mlp, compare_against_monte_carlo
-
-    mlp = build_mlp(width=256, depth=32, seed=0)
-    compare_against_monte_carlo(Estimator(), mlp, estimator_budget=272_000_000_000)

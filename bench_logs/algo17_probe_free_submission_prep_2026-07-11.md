@@ -52,6 +52,8 @@ probes were mis-demoting on these seeds, not just costing compute.
 
 ## Status
 
-PREPARED, NOT SUBMITTED. Artifact: `submission-algo17-probefree-m40.tar.gz`.
-To submit: `uv run whest submit submission-algo17-probefree-m40.tar.gz --watch`.
-To revert the staged surface: `git checkout estimator.py`.
+SUPERSEDED, NEVER SUBMITTED AS-IS. This surface was merged with the remote
+finer-row-buckets line (`origin/algorithm-17-finer-row-buckets-2026-07-11`,
+submission 315824) into Algorithm 18 and submitted as 315844 on 2026-07-11.
+See `bench_logs/submission_learnings_2026-07-11.md`. The stale
+`submission-algo17-probefree-m40.tar.gz` artifact should not be submitted.

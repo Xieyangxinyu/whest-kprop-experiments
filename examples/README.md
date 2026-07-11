@@ -14,13 +14,11 @@ Read in order. Each file is a complete, runnable Stage 1 estimator.
 | [13_sobol_active_set_fold.py](13_sobol_active_set_fold.py) | advanced | Sobol QMC + analytical classification + layer fold |
 | [14_two_ended_layer30_refinement.py](14_two_ended_layer30_refinement.py) | advanced | Previous best family: layer-29 plus layer-30 borderline pilot refinement on top of Sobol active-set folding |
 | [15_dynamic_allocation.py](15_dynamic_allocation.py) | **best** | Algorithm 15 / submission 315204: staged all-layer classification, smooth analytical-variance allocation (`30720..61440`, anchor `49152`), and final-scored-row bookkeeping |
-| [16_argpartition_rowsparse.py](16_argpartition_rowsparse.py) | experimental | Algorithm 16 / submission 315416: exact argpartition-packed row-sparse active propagation on the base/refinement block, with dense continuation blocks for wall-time safety |
-| [17_strassen_rowsparse.py](17_strassen_rowsparse.py) | experimental | Algorithm 17 / submission 315640: block-split packed row-sparse sampled propagation, finer row-bucketed packed residuals including NNZ<=80, chunk `16384`, and guarded one-level Strassen for large dense sampled matmuls |
+| [16_argpartition_rowsparse.py](16_argpartition_rowsparse.py) | **best** | Algorithm 16 / submissions 315640 and 315718: block-split packed row-sparse propagation with guarded Strassen dense paths, row buckets through NNZ<=80, mask reuse, and `put_along_axis` row-order restore |
 
 The main `estimator.py` may be ahead of this curriculum during active experiments. The
 numbered examples preserve stable milestone surfaces: Algorithm 15 is the last pre-row-sparse
-baseline, Algorithm 16 is the first row-sparse submission that transferred cleanly, and
-Algorithm 17 is the first row-bucketed Strassen dense-path submission that transferred cleanly.
+baseline, and Algorithm 16 is the row-sparse/Strassen surface that transferred cleanly.
 
 ## Run any example
 

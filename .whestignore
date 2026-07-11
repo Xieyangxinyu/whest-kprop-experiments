@@ -43,5 +43,6 @@ uv.lock
 # Notebooks and logs (not needed by grader)
 *.ipynb
 eval_variants.py
+estimator_*_tmp.py
 bench_logs/
 submission-*.tar.gz

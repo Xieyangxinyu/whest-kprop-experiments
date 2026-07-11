@@ -188,7 +188,7 @@ def _dense_matmul(x, weights):
     return result
 
 
-def _packed_matmul(x, weights):
+def _packed_matmul(x, weights, positive_mask=None):
     n_rows = x.shape[0]
     prev_width = weights.shape[0]
     out_width = weights.shape[1]
@@ -198,8 +198,9 @@ def _packed_matmul(x, weights):
         stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
         x_chunk = x[start:stop, :]
         chunk_rows = stop - start
+        mask_chunk = positive_mask[start:stop, :] if positive_mask is not None else x_chunk > fnp.float32(0.0)
 
-        nnz_per_row = fnp.sum(x_chunk > fnp.float32(0.0), axis=1)
+        nnz_per_row = fnp.sum(mask_chunk, axis=1)
         max_nnz = int(fnp.max(nnz_per_row))
         if max_nnz == 0:
             chunks.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
@@ -207,6 +208,7 @@ def _packed_matmul(x, weights):
 
         row_order = fnp.argsort(nnz_per_row)
         x_sorted = fnp.take(x_chunk, row_order, axis=0)
+        mask_sorted = fnp.take(mask_chunk, row_order, axis=0)
         sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
         sorted_chunks = []
         group_start = 0
@@ -227,7 +229,8 @@ def _packed_matmul(x, weights):
                 if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
                     sorted_chunks.append(_dense_matmul(x_group, weights))
                 else:
-                    order = fnp.argpartition(x_group == fnp.float32(0.0), k - 1, axis=1)[:, :k]
+                    mask_group = mask_sorted[group_start:group_stop, :]
+                    order = fnp.argpartition(mask_group, prev_width - k, axis=1)[:, -k:]
                     values = fnp.take_along_axis(x_group, order, axis=1)
                     gathered_weights = fnp.take(weights, order, axis=0)
                     sorted_chunks.append(fnp.einsum("nk,nko->no", values, gathered_weights))
@@ -240,7 +243,9 @@ def _packed_matmul(x, weights):
             sorted_chunks.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
 
         pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
-        chunks.append(fnp.take(pre_sorted, fnp.argsort(row_order), axis=0))
+        pre_chunk = fnp.zeros_like(pre_sorted)
+        fnp.put_along_axis(pre_chunk, row_order[:, None], pre_sorted, axis=0)
+        chunks.append(pre_chunk)
 
     if len(chunks) == 1:
         return chunks[0]
@@ -251,24 +256,26 @@ def _packed_relu_matmul(x, weights):
     return fnp.maximum(_packed_matmul(x, weights), 0.0)
 
 
-def _split_matmul_with_fire(x, weights, fire_rate, threshold: float):
+def _split_matmul_with_fire(x, weights, fire_rate, threshold: float, positive_mask=None):
     dense_pos = fnp.nonzero(fire_rate >= fnp.float32(threshold))[0]
     sparse_pos = fnp.nonzero(fire_rate < fnp.float32(threshold))[0]
 
     if len(dense_pos) < _BLOCK_SPLIT_MIN_DENSE_COLS or len(sparse_pos) < _BLOCK_SPLIT_MIN_SPARSE_COLS:
-        return _packed_matmul(x, weights)
+        return _packed_matmul(x, weights, positive_mask)
 
     x_dense = fnp.take(x, dense_pos, axis=1)
     w_dense = fnp.take(weights, dense_pos, axis=0)
     x_sparse = fnp.take(x, sparse_pos, axis=1)
     w_sparse = fnp.take(weights, sparse_pos, axis=0)
-    return _dense_matmul(x_dense, w_dense) + _packed_matmul(x_sparse, w_sparse)
+    sparse_mask = None if positive_mask is None else fnp.take(positive_mask, sparse_pos, axis=1)
+    return _dense_matmul(x_dense, w_dense) + _packed_matmul(x_sparse, w_sparse, sparse_mask)
 
 
 def _block_split_matmul(x, weights, layer_idx: int):
     _ = layer_idx
-    fire_rate = fnp.mean(x > fnp.float32(0.0), axis=0)
-    return _split_matmul_with_fire(x, weights, fire_rate, _BLOCK_SPLIT_FIRE_THRESH)
+    positive_mask = x > fnp.float32(0.0)
+    fire_rate = fnp.mean(positive_mask, axis=0)
+    return _split_matmul_with_fire(x, weights, fire_rate, _BLOCK_SPLIT_FIRE_THRESH, positive_mask)
 
 
 def _block_split_relu_matmul(x, weights, layer_idx: int):

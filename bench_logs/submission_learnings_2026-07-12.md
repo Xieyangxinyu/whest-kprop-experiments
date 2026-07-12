@@ -2,6 +2,36 @@
 
 ## Submission Log
 
+### Submission 316005 - Algorithm 25 row-dense fallback
+
+- Result: improved
+- Change: Algorithm 25 wall-safe surface on top of Algorithm 24 complex64 dense
+  packing: no low-8 row bucket, immediate Strassen accumulation, half-only Sobol
+  load, `chunk_rows=16384`, and packed row-sparse groups fall back to the
+  existing complex/Strassen dense path once `k > width/2` after column fire
+  splitting. Aggregate row-dense full-matrix prototype was rejected locally; not
+  included. Artifact `submission-algo25-rowdense-2026-07-12.tar.gz` packages
+  `estimator.py`, `sobol_points.npz`, `requirements.txt`, `LICENSE`.
+- Local expectation: vs Algorithm 24 fixed public-mini subprocess checks,
+  adjusted improved `-12.64%` on n=3 (`1.601e-7 -> 1.399e-7`) and `-13.94%` on
+  n=5 (`1.168e-7 -> 1.005e-7`) with raw final MSE effectively unchanged and
+  `0` failures. Cap-sample direct timing on all 13 public-mini cap MLPs stayed
+  under 60s (max `25.03s`, mean `17.55s`); subprocess prefix n=29 had `0`
+  failures and first five cap rows max wall `13.47s`.
+- Leaderboard/public evidence: GRADED, public adjusted `1.002851105788e-7`, raw
+  final MSE `3.724967319840e-7`, `0/50` public failures. Improved `-0.3240%`
+  vs Algorithm 24 / submission 315998 (`1.006111002092e-7`, raw
+  `3.724939691097e-7`). Raw MSE was effectively unchanged/slightly worse
+  (`+0.000742%`), so the gain came from compute multiplier:
+  `0.2664105 -> 0.2653999` (`-0.3793%`), mean effective compute
+  `72.464G -> 72.189G`. Per-public-row adjusted wins `28/50`, raw wins `27/50`.
+- Decision: keep - 316005 is the new graded frontier. Use row-dense fallback as
+  current submission surface; do not port aggregate dense prototype, which was
+  locally faster but worse on adjusted score.
+- Lesson: do not compare only wall time; the chosen candidate beat Algorithm 24
+  on adjusted score and wall, while the aggregate dense prototype was faster but
+  locally worse on adjusted score.
+
 ### Submission 315898 - Algorithm 23 (pilot-reuse probes + layer-wise fire thresholds)
 
 - Result: still grading

@@ -21,6 +21,7 @@ classification probes stay on plain dense matmul to avoid probe-path overhead.
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import flopscope as flops
@@ -28,10 +29,34 @@ import flopscope.numpy as fnp
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
-_BASE_SAMPLES = 30720
-_ANCHOR_SAMPLES = 49152
-_MAX_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
-_EASY_SAMPLES = 30720
+
+def _fast_divisor() -> float:
+    """Sample-shrink factor for fast FLOP-iteration runs.
+
+    Set ``WHEST_FAST=1`` to enable fast mode (default divisor 16). Override the
+    factor with ``WHEST_FAST_DIV=<float>``. Fast mode scales every ``*_SAMPLES``
+    constant by the same factor so the adaptive continuation logic stays
+    proportional; it is a dev-loop knob only and must NOT be used for scoring or
+    submission runs.
+    """
+    if not os.environ.get("WHEST_FAST"):
+        return 1.0
+    try:
+        return max(1.0, float(os.environ.get("WHEST_FAST_DIV", "16")))
+    except ValueError:
+        return 16.0
+
+
+def _fast_scale(value: int) -> int:
+    """Scale a sample count by the fast divisor, kept even and >= 2."""
+    scaled = int(round(value / _fast_divisor() / 2.0)) * 2
+    return max(2, scaled)
+
+
+_BASE_SAMPLES = _fast_scale(30720)
+_ANCHOR_SAMPLES = _fast_scale(49152)
+_MAX_SAMPLES = _fast_scale(61440)  # 30720 Sobol half-samples x 2 (antithetic)
+_EASY_SAMPLES = _fast_scale(30720)
 _VAR_REF = 0.02143
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0

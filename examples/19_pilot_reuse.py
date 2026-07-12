@@ -1,15 +1,18 @@
-"""Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
+"""Algorithm 19: pilot-reuse classification on the finer-row-buckets surface.
 
-Builds on Algorithm 17 / submission 315824. The single _BLOCK_SPLIT_FIRE_THRESH
-(0.75) is replaced by a per-layer map fitted from a 4-net fire-rate census
-(nets 0-3, mini split): a column firing at rate f costs ~1.94*f per
-row-output in the packed path vs ~1.76 flat in the Strassen dense block, so
-the FLOP crossover sits near f=0.91, not 0.75 - and the optimum is
-layer-dependent because small dense blocks miss the Strassen MIN_IN=64
-discount (layer 31 packs everything). Routing is exact: raw MSE is
-bit-identical; measured flops -0.90% on the fit nets, -0.72% on holdout
-nets 4-12. A global threshold shift is measurably flat - only the per-layer
-map wins.
+Builds on Algorithm 17 / submission 315824. The staged mid-layer kink->dead
+demotion probes (dedicated 5% probe matmuls + 20% recheck matmuls, outputs
+discarded) are replaced by a SINGLE pilot pass that reuses the base samples:
+the leading 20% of block rows are propagated over ALL candidate active columns
+with the ordinary packed/block-split machinery, sampled alphas are read off
+those pre-activations, demotions are decided, and the pilot chunk is kept as
+the surviving columns' first rows — only the remaining 80% of rows are then
+propagated over the surviving set. Columns promoted dead->kink after the pilot
+get a small dedicated pilot top-up. This removes the dedicated demotion-probe
+matmuls and the staged recheck while giving every probe-eligible column the
+full 20% row budget for its alpha estimate. The dead->kink promotion probes
+and the layer-30 on/dead probes are unchanged (they inspect columns outside
+the computed set; nothing exists to reuse).
 
 Original Algorithm 17 header follows.
 Algorithm 17: finer antithetic row buckets for block-split row-sparse propagation.
@@ -79,26 +82,12 @@ _PACKED_ROWSPARSE_MAX_K_DEN = 4
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
 _BLOCK_SPLIT_ROWSPARSE = True
 _BLOCK_SPLIT_FIRE_THRESH = 0.75
-# Per-layer overrides fitted on the nets 0-3 fire-rate census (fire_oracle),
-# holdout-validated on nets 4-12; layers absent here fall back to the default.
-_BLOCK_SPLIT_FIRE_THRESH_BY_LAYER = {
-    2: 0.825, 3: 0.925, 4: 0.95, 5: 0.8, 6: 0.825, 7: 0.825, 8: 0.85,
-    9: 0.875, 10: 0.9, 11: 0.875, 12: 0.9, 13: 0.875, 14: 0.925,
-    15: 0.85, 16: 0.8, 17: 0.9, 18: 0.8, 19: 0.875, 20: 0.925,
-    21: 0.925, 22: 0.925, 23: 0.95, 24: 0.925, 25: 0.9, 26: 0.925,
-    27: 0.95, 28: 0.75, 29: 0.7, 30: 0.8, 31: 1.0,
-}
 _BLOCK_SPLIT_MIN_DENSE_COLS = 32
 _BLOCK_SPLIT_MIN_SPARSE_COLS = 16
 _DENSE_STRASSEN = True
 _DENSE_STRASSEN_MIN_ROWS = 4096
 _DENSE_STRASSEN_MIN_IN = 64
 _DENSE_STRASSEN_MIN_OUT = 64
-# Row-axis complex64 sample packing: rows i and i+n/2 ride the real/imag lanes
-# of one half-shape matmul. Real weights never mix the lanes, so results are
-# exact; the remainder row (odd counts) stays on the real path.
-_COMPLEX_PACK = True
-_COMPLEX_PACK_MIN_ROWS = 256
 
 
 def _scatter(values, idx, width):
@@ -188,18 +177,6 @@ def _strassen_even_matmul(x, weights):
 
 
 def _dense_matmul(x, weights):
-    if _COMPLEX_PACK and x.shape[0] >= _COMPLEX_PACK_MIN_ROWS:
-        half = x.shape[0] // 2
-        xc = x[:half, :].astype(fnp.complex64) + x[half : 2 * half, :].astype(fnp.complex64) * fnp.complex64(1j)
-        pc = _dense_matmul_core(xc, weights.astype(fnp.complex64))
-        parts = [fnp.real(pc), fnp.imag(pc)]
-        if 2 * half < x.shape[0]:
-            parts.append(_dense_matmul_core(x[2 * half :, :], weights))
-        return fnp.concatenate(parts, axis=0)
-    return _dense_matmul_core(x, weights)
-
-
-def _dense_matmul_core(x, weights):
     row_count = x.shape[0]
     in_width = weights.shape[0]
     out_width = weights.shape[1]
@@ -320,8 +297,7 @@ def _block_split_matmul(x, weights, layer_idx: int):
     if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
         return _packed_matmul(x, weights, positive_mask)
     fire_rate = fnp.mean(positive_mask, axis=0)
-    threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
-    return _split_matmul_with_fire(x, weights, fire_rate, threshold, positive_mask)
+    return _split_matmul_with_fire(x, weights, fire_rate, _BLOCK_SPLIT_FIRE_THRESH, positive_mask)
 
 
 def _block_split_relu_matmul(x, weights, layer_idx: int):
@@ -342,7 +318,7 @@ class Estimator(BaseEstimator):
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
-            data = fnp.load(str(Path(__file__).resolve().parent / "sobol_points.npz"))
+            data = fnp.load(str(Path(__file__).resolve().parent.parent / "sobol_points.npz"))
             self._sobol_points = data["points"]
 
     def _initial_structure(self, mlp: MLP, width: int) -> dict:
@@ -431,6 +407,11 @@ class Estimator(BaseEstimator):
             idx = active_indices[layer_idx]
             kink_idx = kink_indices[layer_idx]
             on_idx = on_indices[layer_idx]
+            pilot_pre = None
+            pilot_cand_idx = None
+            pilot_kept_idx = None
+            pilot_rows_n = 0
+            newly_promoted_idx = idx[:0]
 
             if len(idx) == 0:
                 mc_rows.append(fnp.zeros(width))
@@ -448,10 +429,22 @@ class Estimator(BaseEstimator):
                 trusted_kink_idx = kink_idx[~active_dead_probe_mask]
                 probe_kink_idx = kink_idx[active_dead_probe_mask]
                 if len(probe_kink_idx) > 0:
-                    w_kink_probe = w[prev_idx, :][:, probe_kink_idx]
-                    kept_probe_kink_idx, demoted_kink_idx = _staged_threshold_split(
-                        probe_kink_idx, x, w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
-                    )
+                    # Single pilot pass, reusing base samples: propagate the leading rows
+                    # over ALL candidate active columns (the main matmul needs these
+                    # pre-activations anyway), read sampled alpha off them, decide
+                    # demotions. Propagation of the pilot chunk is completed at the
+                    # generic step below; no dedicated probe matmuls, no staged recheck.
+                    pilot_rows_n = _probe_rows(n_samples, _PILOT_RECHECK_FRACTION)
+                    pilot_cand_idx = idx  # kink + on, sorted
+                    w_cand = w[prev_idx, :][:, pilot_cand_idx]
+                    pilot_pre = _block_split_matmul(x[:pilot_rows_n, :], w_cand, layer_idx)
+                    mean_p = fnp.mean(pilot_pre, axis=0)
+                    var_p = fnp.var(pilot_pre, axis=0)
+                    alpha_pilot = mean_p / fnp.sqrt(fnp.maximum(var_p, 1e-12))
+                    probe_pos = fnp.searchsorted(pilot_cand_idx, probe_kink_idx)
+                    keep_mask = alpha_pilot[probe_pos] > fnp.float32(_ACTIVE_DEAD_THRESH)
+                    kept_probe_kink_idx = probe_kink_idx[keep_mask]
+                    demoted_kink_idx = probe_kink_idx[~keep_mask]
                 else:
                     kept_probe_kink_idx = kink_idx[:0]
                     demoted_kink_idx = kink_idx[:0]
@@ -466,6 +459,7 @@ class Estimator(BaseEstimator):
                 idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
                 kink_indices[layer_idx] = kink_idx
                 active_indices[layer_idx] = idx
+                pilot_kept_idx = idx  # subset of pilot_cand_idx surviving demotion
 
             if layer_idx == 30 and len(on_idx) > 0 and prev_idx is not None:
                 x_before_fold = x
@@ -583,8 +577,27 @@ class Estimator(BaseEstimator):
                     idx = fnp.sort(fnp.concatenate([kink_idx, on_idx]))
                     kink_indices[layer_idx] = kink_idx
                     active_indices[layer_idx] = idx
+                    newly_promoted_idx = promoted_idx
 
-            if prev_idx is None:
+            if pilot_pre is not None:
+                # complete the layer using the pilot chunk: reuse its columns for the
+                # surviving candidates, top up any newly promoted columns, then
+                # propagate only the remaining rows over the final active set
+                kept_pos = fnp.searchsorted(pilot_cand_idx, pilot_kept_idx)
+                x_pilot_kept = fnp.maximum(fnp.take(pilot_pre, kept_pos, axis=1), 0.0)
+                if len(newly_promoted_idx) > 0:
+                    w_prom = w[prev_idx, :][:, newly_promoted_idx]
+                    x_pilot_prom = fnp.maximum(x[:pilot_rows_n, :] @ w_prom, 0.0)
+                    col_order = fnp.argsort(fnp.concatenate([pilot_kept_idx, newly_promoted_idx]))
+                    x_pilot = fnp.take(
+                        fnp.concatenate([x_pilot_kept, x_pilot_prom], axis=1), col_order, axis=1
+                    )
+                else:
+                    x_pilot = x_pilot_kept
+                w_active = w[prev_idx, :][:, idx]
+                x_rest = _block_split_relu_matmul(x[pilot_rows_n:, :], w_active, layer_idx)
+                x = fnp.concatenate([x_pilot, x_rest], axis=0)
+            elif prev_idx is None:
                 w_active = w[:, idx]
                 half_rows = n_samples // 2
                 pre_half = _dense_matmul(x[:half_rows, :], w_active)
@@ -648,3 +661,13 @@ class Estimator(BaseEstimator):
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
         return fnp.stack(combined_rows, axis=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from local_engine import build_mlp, compare_against_monte_carlo
+
+    mlp = build_mlp(width=256, depth=32, seed=0)
+    compare_against_monte_carlo(Estimator(), mlp, estimator_budget=272_000_000_000)

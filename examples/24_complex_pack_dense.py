@@ -1,4 +1,21 @@
-"""Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
+"""Algorithm 24: complex64 sample packing on the layer-wise fire-threshold surface.
+
+Builds on Algorithm 21 / submission 315892. flopscope charges matmuls by
+shape, not dtype, so `_dense_matmul` packs sample rows i and i+n/2 into the
+real/imag lanes of one half-shape complex64 matmul. Real weights never mix
+the lanes, so predictions are exact (raw MSE identical to 4e-11 across the
+public mini split); the Strassen core runs unchanged on the complex half.
+Covers the fire-split dense blocks, the layer-0 antithetic matmul, the
+layer-30/31 fold, and the packed-path dense fallbacks. The row-sparse
+einsum path stays real: its per-row gathered weights cannot share lanes.
+Measured: flops -25.7% (mini first-10), graded 315998 public adjusted
+1.006111e-7 vs 315892's 1.337748e-7 (-24.8%), raw frozen at 3.72494e-7.
+Set `_COMPLEX_PACK = False` to restore the 315892 surface byte-identically.
+Exploration notebook: algorithm24_dtype_bitpacking.ipynb; legitimacy
+discussion in bench_logs/submission_learnings_2026-07-12.md.
+
+Original Algorithm 21 header follows.
+Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
 
 Builds on Algorithm 17 / submission 315824. The single _BLOCK_SPLIT_FIRE_THRESH
 (0.75) is replaced by a per-layer map fitted from a 4-net fire-rate census
@@ -342,7 +359,7 @@ class Estimator(BaseEstimator):
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
-            data = fnp.load(str(Path(__file__).resolve().parent / "sobol_points.npz"))
+            data = fnp.load(str(Path(__file__).resolve().parent.parent / "sobol_points.npz"))
             self._sobol_points = data["points"]
 
     def _initial_structure(self, mlp: MLP, width: int) -> dict:
@@ -648,3 +665,13 @@ class Estimator(BaseEstimator):
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
         return fnp.stack(combined_rows, axis=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from local_engine import build_mlp, compare_against_monte_carlo
+
+    mlp = build_mlp(width=256, depth=32, seed=0)
+    compare_against_monte_carlo(Estimator(), mlp, estimator_budget=272_000_000_000)

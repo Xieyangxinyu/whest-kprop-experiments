@@ -21,6 +21,10 @@ Submission 315718 added mask reuse and a `put_along_axis` row-order restore.
 Submission 315824 added finer row buckets around half-density antithetic layer-1
 rows (`112, 144, 160, 176`) as a submission-safe way to recover part of the
 rejected private antithetic pair-complement optimization.
+Submission 315843 kept this bucket-16 surface and transferred exact packed-bucket
+cleanup. Submission 315851 made Algorithm 17 current best by removing the special
+low-`8` row limit, using immediate Strassen accumulation, and loading only Sobol
+half-samples before the exact first-layer antithetic reconstruction.
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ _PACKED_ROWSPARSE_START_LAYER = 1
 _PACKED_ROWSPARSE_STOP_LAYER = 29
 _PACKED_ROWSPARSE_CHUNK_ROWS = 16384
 _PACKED_ROWSPARSE_BUCKET = 16
-_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
+_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
 _PACKED_ROWSPARSE_MAX_K_NUM = 3
 _PACKED_ROWSPARSE_MAX_K_DEN = 4
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
@@ -141,18 +145,31 @@ def _strassen_even_matmul(x, weights):
     w21 = weights[half_in:, :half_out]
     w22 = weights[half_in:, half_out:]
 
-    prod1 = (x11 + x22) @ (w11 + w22)
-    prod2 = (x21 + x22) @ w11
-    prod3 = x11 @ (w12 - w22)
-    prod4 = x22 @ (w21 - w11)
-    prod5 = (x11 + x12) @ w22
-    prod6 = (x21 - x11) @ (w11 + w12)
-    prod7 = (x12 - x22) @ (w21 + w22)
+    prod = (x11 + x22) @ (w11 + w22)
+    out11 = prod
+    out22 = prod
 
-    out11 = prod1 + prod4 - prod5 + prod7
-    out12 = prod3 + prod5
-    out21 = prod2 + prod4
-    out22 = prod1 - prod2 + prod3 + prod6
+    prod = (x21 + x22) @ w11
+    out21 = prod
+    out22 = out22 - prod
+
+    prod = x11 @ (w12 - w22)
+    out12 = prod
+    out22 = out22 + prod
+
+    prod = x22 @ (w21 - w11)
+    out11 = out11 + prod
+    out21 = out21 + prod
+
+    prod = (x11 + x12) @ w22
+    out11 = out11 - prod
+    out12 = out12 + prod
+
+    prod = (x21 - x11) @ (w11 + w12)
+    out22 = out22 + prod
+
+    prod = (x12 - x22) @ (w21 + w22)
+    out11 = out11 + prod
 
     top = fnp.concatenate([out11, out12], axis=1)
     bottom = fnp.concatenate([out21, out22], axis=1)
@@ -369,8 +386,7 @@ class Estimator(BaseEstimator):
                 f"sobol_points.npz has {self._sobol_points.shape[0]} half-samples, "
                 f"but this estimator needs {end_half}."
             )
-        half = fnp.array(self._sobol_points[start_half:end_half, :width])
-        return fnp.concatenate([half, -half], axis=0)
+        return fnp.array(self._sobol_points[start_half:end_half, :width])
 
     def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
         width = mlp.width

@@ -56,7 +56,7 @@ _PACKED_ROWSPARSE_START_LAYER = 1
 _PACKED_ROWSPARSE_STOP_LAYER = 29
 _PACKED_ROWSPARSE_CHUNK_ROWS = 16384
 _PACKED_ROWSPARSE_BUCKET = 16
-_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 8, 16, 32, 48, 64, 80, 96, 128, 192)
+_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 16, 32, 48, 64, 80, 96, 128, 192)
 _PACKED_ROWSPARSE_MAX_K_NUM = 3
 _PACKED_ROWSPARSE_MAX_K_DEN = 4
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
@@ -214,11 +214,10 @@ def _packed_matmul(x, weights, positive_mask=None):
         sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
         sorted_chunks = []
         group_start = 0
-        bucket_limits = list(_PACKED_ROWSPARSE_ROW_BUCKETS) + [prev_width]
-        for limit in bucket_limits:
+        for limit in _PACKED_ROWSPARSE_ROW_BUCKETS:
             if limit > prev_width:
                 continue
-            group_stop = int(fnp.sum(sorted_nnz <= limit))
+            group_stop = int(fnp.searchsorted(sorted_nnz, limit, side="right"))
             if group_stop <= group_start:
                 continue
 
@@ -245,7 +244,7 @@ def _packed_matmul(x, weights, positive_mask=None):
             sorted_chunks.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
 
         pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
-        pre_chunk = fnp.zeros_like(pre_sorted)
+        pre_chunk = fnp.empty_like(pre_sorted)
         fnp.put_along_axis(pre_chunk, row_order[:, None], pre_sorted, axis=0)
         chunks.append(pre_chunk)
 
@@ -274,8 +273,9 @@ def _split_matmul_with_fire(x, weights, fire_rate, threshold: float, positive_ma
 
 
 def _block_split_matmul(x, weights, layer_idx: int):
-    _ = layer_idx
     positive_mask = x > fnp.float32(0.0)
+    if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
+        return _packed_matmul(x, weights, positive_mask)
     fire_rate = fnp.mean(positive_mask, axis=0)
     return _split_matmul_with_fire(x, weights, fire_rate, _BLOCK_SPLIT_FIRE_THRESH, positive_mask)
 
@@ -369,7 +369,7 @@ class Estimator(BaseEstimator):
         half = fnp.array(self._sobol_points[start_half:end_half, :width])
         return fnp.concatenate([half, -half], axis=0)
 
-    def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, float, dict]:
+    def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
         width = mlp.width
         active_indices = list(structure["active_indices"])
         kink_indices = list(structure["kink_indices"])
@@ -583,24 +583,22 @@ class Estimator(BaseEstimator):
             "analytical_rows": analytical_rows,
             "alpha_rows": alpha_rows,
         }
-        return rows, 0.0, refined_structure
+        return rows, refined_structure
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
-        _ = budget
         width = mlp.width
         structure = self._initial_structure(mlp, width)
         target_samples = _choose_samples(structure["final_var_mean"])
         base_x = self._sample_block(0, _BASE_SAMPLES // 2, width)
-        base_rows, final_anal_diff_mean, refined_structure = self._run_block(
+        base_rows, refined_structure = self._run_block(
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
-        _ = final_anal_diff_mean
         if target_samples <= _BASE_SAMPLES:
             return fnp.stack(base_rows, axis=0)
 
         extra_samples = target_samples - _BASE_SAMPLES
         extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
-        extra_rows, _, _ = self._run_block(mlp, refined_structure, extra_x, extra_samples, refine=False)
+        extra_rows = self._run_block(mlp, refined_structure, extra_x, extra_samples, refine=False)[0]
         combined_rows = [
             (base_row * _BASE_SAMPLES + extra_row * extra_samples) / target_samples
             for base_row, extra_row in zip(base_rows, extra_rows)

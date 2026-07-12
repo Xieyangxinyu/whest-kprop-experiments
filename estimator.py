@@ -91,6 +91,8 @@ _DENSE_STRASSEN = True
 _DENSE_STRASSEN_MIN_ROWS = 4096
 _DENSE_STRASSEN_MIN_IN = 64
 _DENSE_STRASSEN_MIN_OUT = 64
+_COMPLEX_PACK = True
+_COMPLEX_PACK_MIN_ROWS = 256
 
 
 def _scatter(values, idx, width):
@@ -146,6 +148,29 @@ def _ceil_bucket(value: int, bucket: int, limit: int) -> int:
     return min(limit, max(0, bucketed))
 
 
+def _cpack_matmul(x, weights):
+    """Compute ``x @ weights`` (real ``weights``) via a single complex matmul.
+
+    flopscope bills a complex matmul as one real matmul of the same shape, so
+    splitting the rows into two halves ``top``/``bot`` and evaluating
+    ``(top + 1j*bot) @ weights`` costs half of two real matmuls. Because
+    ``weights`` is real, ``real(prod) == top @ weights`` and
+    ``imag(prod) == bot @ weights`` exactly; using complex64 preserves the
+    float32 accumulation, so the result is bit-identical to ``x @ weights``.
+    """
+    rows = x.shape[0]
+    if not _COMPLEX_PACK or rows < _COMPLEX_PACK_MIN_ROWS:
+        return x @ weights
+    half = rows // 2
+    top = x[:half, :].astype(fnp.complex64)
+    bot = x[half:2 * half, :].astype(fnp.complex64)
+    prod = (top + bot * fnp.complex64(1j)) @ weights
+    out = fnp.concatenate([prod.real, prod.imag], axis=0)
+    if 2 * half == rows:
+        return out
+    return fnp.concatenate([out, x[2 * half:, :] @ weights], axis=0)
+
+
 def _strassen_even_matmul(x, weights):
     half_rows = x.shape[0] // 2
     half_in = weights.shape[0] // 2
@@ -161,13 +186,13 @@ def _strassen_even_matmul(x, weights):
     w21 = weights[half_in:, :half_out]
     w22 = weights[half_in:, half_out:]
 
-    prod1 = (x11 + x22) @ (w11 + w22)
-    prod2 = (x21 + x22) @ w11
-    prod3 = x11 @ (w12 - w22)
-    prod4 = x22 @ (w21 - w11)
-    prod5 = (x11 + x12) @ w22
-    prod6 = (x21 - x11) @ (w11 + w12)
-    prod7 = (x12 - x22) @ (w21 + w22)
+    prod1 = _cpack_matmul(x11 + x22, w11 + w22)
+    prod2 = _cpack_matmul(x21 + x22, w11)
+    prod3 = _cpack_matmul(x11, w12 - w22)
+    prod4 = _cpack_matmul(x22, w21 - w11)
+    prod5 = _cpack_matmul(x11 + x12, w22)
+    prod6 = _cpack_matmul(x21 - x11, w11 + w12)
+    prod7 = _cpack_matmul(x12 - x22, w21 + w22)
 
     out11 = prod1 + prod4 - prod5 + prod7
     out12 = prod3 + prod5
@@ -189,26 +214,26 @@ def _dense_matmul(x, weights):
         or in_width < _DENSE_STRASSEN_MIN_IN
         or out_width < _DENSE_STRASSEN_MIN_OUT
     ):
-        return x @ weights
+        return _cpack_matmul(x, weights)
 
     core_rows = row_count - (row_count % 2)
     core_in = in_width - (in_width % 2)
     core_out = out_width - (out_width % 2)
     if core_rows < _DENSE_STRASSEN_MIN_ROWS or core_in < _DENSE_STRASSEN_MIN_IN or core_out < _DENSE_STRASSEN_MIN_OUT:
-        return x @ weights
+        return _cpack_matmul(x, weights)
 
     result_core = _strassen_even_matmul(x[:core_rows, :core_in], weights[:core_in, :core_out])
     if core_in < in_width:
-        result_core = result_core + (x[:core_rows, core_in:] @ weights[core_in:, :core_out])
+        result_core = result_core + _cpack_matmul(x[:core_rows, core_in:], weights[core_in:, :core_out])
 
     if core_out < out_width:
-        right_cols = x[:core_rows, :] @ weights[:, core_out:]
+        right_cols = _cpack_matmul(x[:core_rows, :], weights[:, core_out:])
         result = fnp.concatenate([result_core, right_cols], axis=1)
     else:
         result = result_core
 
     if core_rows < row_count:
-        bottom_rows = x[core_rows:, :] @ weights
+        bottom_rows = _cpack_matmul(x[core_rows:, :], weights)
         return fnp.concatenate([result, bottom_rows], axis=0)
     return result
 

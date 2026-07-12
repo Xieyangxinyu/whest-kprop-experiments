@@ -39,14 +39,14 @@
 - Decision: keep as current best safe/native row-sparse surface; the cleanup transferred but only by a tiny margin over 315824 (`1.3489169563638498e-07`).
 - Lesson: exact-output cleanup and `searchsorted` bucket boundaries can transfer, but public movement is very small; keep future cleanup variants similarly exact and deterministic on FLOPs.
 
-### Submission 315849 - No-Bucket8 Strassen/Half-Sample Cleanup
+### Submission 315849 - Bucket-16 Strassen/Half-Sample Cleanup
 
 - Result: regressed versus current best, but beat 315824 slightly.
-- Change: packaged bucket-16 row-bucket surface with SC16-style immediate Strassen accumulation, half-sample-only Sobol loading, and `_DENSE_STRASSEN_MIN_ROWS = 1024`; did not include targeted bucket-8 row buckets.
+- Change: packaged bucket-16 row-bucket surface with SC16-style immediate Strassen accumulation, half-sample-only Sobol loading, and `_DENSE_STRASSEN_MIN_ROWS = 1024`.
 - Local expectation: `whest validate` passed; subprocess seed42 n3 passed with `0/3` failures, adjusted `1.4935626492445296e-7`, raw final MSE `4.2683230579617276e-7`, mean effective compute `95.009G`.
 - Leaderboard/public evidence: AIcrowd submission id `315849`; graded successfully with public adjusted score `1.34888792540272e-07`, public raw final MSE / secondary score `3.724907685409562e-07`.
 - Decision: do not replace current best `315843` (`1.3487136997788326e-07`); the non-bucket cleanup transferred versus `315824` (`1.3489169563638498e-07`), but not enough to beat packed bucket boundary cleanup.
-- Lesson: SC16 accumulation/half-sample/1024-row threshold are submission-safe small positives, but the no-bucket8 surface is not the current best; continue from 315843 or a properly validated targeted bucket-8 artifact.
+- Lesson: SC16 accumulation/half-sample/1024-row threshold are submission-safe small positives, but this surface is not the current best; continue from the current bucket-16 base.
 
 ### Submission 315851 - No 8-Limit Strassen/Half-Sample Isolate
 
@@ -56,3 +56,12 @@
 - Leaderboard/public evidence: AIcrowd submission id `315851`; graded successfully with public adjusted score `1.348653018476005e-07`, public raw final MSE / secondary score `3.724907429614177e-07`.
 - Decision: keep as current best over `315843` (`1.3487136997788326e-07`), despite slightly worse raw final MSE than `315843` (`3.724907188029647e-07`).
 - Lesson: removing the special `8` row-bucket limit transferred; the adjusted win is likely from lower effective compute/backend overhead, not raw-MSE improvement.
+
+### Submission 315856 - Packed Chunk 24576
+
+- Result: improved; new current best.
+- Change: changed `_PACKED_ROWSPARSE_CHUNK_ROWS` from `16384` to `24576`; artifact `submission-chunk24576-2026-07-11.tar.gz` packaged `estimator.py`, `requirements.txt`, and `sobol_points.npz`.
+- Local expectation: direct local chunk probes were exact-output; seeds `42,43,44` improved mean effective compute by ~`4.72B` versus `16384`, and seeds `7,8,9` improved by ~`0.61B`. Edited-estimator validation passed; local seed7 n3 had `0/3` failures, raw final MSE `8.862861022862489e-07`, mean effective compute `87.195G`; subprocess seed7 n3 had `0/3` failures, same raw/all-layer MSE and tracked FLOPs, mean effective compute `88.674G`.
+- Leaderboard/public evidence: AIcrowd submission id `315856`; graded successfully with public adjusted score shown as `1.343e-07`, secondary/raw final MSE shown as `3.72e-07`, all-layers MSE `8.164e-04`, and `0/50` public failures.
+- Decision: keep `24576` chunk size as current best over `315851` (`1.348653018476005e-07`).
+- Lesson: the exact-output chunk-size timing gain transferred publicly; prefer `24576` over `16384`, while larger chunk sizes remain unproven/noisier.

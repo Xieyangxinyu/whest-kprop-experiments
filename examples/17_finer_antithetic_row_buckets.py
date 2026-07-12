@@ -22,9 +22,10 @@ Submission 315824 added finer row buckets around half-density antithetic layer-1
 rows (`112, 144, 160, 176`) as a submission-safe way to recover part of the
 rejected private antithetic pair-complement optimization.
 Submission 315843 kept this bucket-16 surface and transferred exact packed-bucket
-cleanup. Submission 315851 made Algorithm 17 current best by removing the special
-low-`8` row limit, using immediate Strassen accumulation, and loading only Sobol
-half-samples before the exact first-layer antithetic reconstruction.
+cleanup. Submission 315851 improved by removing the special low-`8` row limit,
+using immediate Strassen accumulation, and loading only Sobol half-samples before
+the exact first-layer antithetic reconstruction. Submission 315856 made Algorithm
+17 current best by increasing packed row-sparse chunks to 24,576 rows.
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ _MATERIALIZE_INTERMEDIATE_ROWS = False
 _PACKED_ROWSPARSE = True
 _PACKED_ROWSPARSE_START_LAYER = 1
 _PACKED_ROWSPARSE_STOP_LAYER = 29
-_PACKED_ROWSPARSE_CHUNK_ROWS = 16384
+_PACKED_ROWSPARSE_CHUNK_ROWS = 24576
 _PACKED_ROWSPARSE_BUCKET = 16
 _PACKED_ROWSPARSE_ROW_BUCKETS = (0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
 _PACKED_ROWSPARSE_MAX_K_NUM = 3

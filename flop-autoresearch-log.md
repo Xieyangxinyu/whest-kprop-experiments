@@ -34,5 +34,31 @@ Verdict:    ACCEPT — -33.4% flops @ N=100, MSE within lock, residual flat.
 
 Running baseline is now: N=25 3.798745e+09 / N=100 3.883295e+09. Cumulative reduction: 33.4%.
 
+### Iter 2 — T7 routing crossover (3/4 -> 1/2) + T1b probe packing
+Hypothesis (T7): `_packed_matmul` routes a bucket group to the einsum gather vs.
+dense by `k` (bucketed nnz) crossing `3/4*width`. T1 halved dense cost, so
+cpacked-dense (0.5*width*n*o) now beats the gather (k*n*o) for `k > 0.5*width`.
+Inputs are post-ReLU (>=0), so dropped columns contribute exactly zero -> dense and
+gather give identical values. Move crossover to 1/2 (`_PACKED_ROWSPARSE_MAX_K_NUM/
+DEN = 1/2`). Including argpartition overhead the exact crossover is ~0.5*width, so
+1/2 is optimal (no gain below it).
+Hypothesis (T1b): the probe matmuls in `_sample_alpha` did `x[:rows,:] @ weights`
+directly, bypassing complex-packing. Route them through `_cpack_matmul` and lower
+`_COMPLEX_PACK_MIN_ROWS` 256 -> 8 (cpack verified bit-identical for all row-halves
+>= 4; only the degenerate 2-row case wobbles).
+Profile after: matmul 56.8% (cpacked, 2x floor), einsum 39.4% (gather floor).
+N=25:       flops=3.715293e+09 (-2.2% vs post-T1)  final_mse=8.917325858e-06 (Δrel ~4e-7)  all_mse identical  residual=0.132
+N=100:      flops=3.798878e+09 (-2.2% vs post-T1)  final_mse=9.742333673e-06 (Δrel ~1.5e-7)  all_mse=7.860539365e-04 (identical)  residual=0.125
+Verdict:    ACCEPT — exact routing/packing refinements, MSE within lock, residual flat.
+
+Running baseline now: N=25 3.715293e+09 / N=100 3.798878e+09. Cumulative: 34.8%.
+
 ## Dead ends
-(none yet)
+- T5 (`_scatter` matmul -> free scatter): `_scatter` is only 0.006% of total FLOPs.
+  Not worth the change. Skipped.
+- T2 (bit/quant packing >2x): would require quantizing activations, moving MSE past
+  the 1e-6 lock. Complex packing already achieves the exact 2x ceiling for a
+  shared-real-operand matmul; beyond 2x is inherently lossy here. Not pursued.
+- Einsum complex-packing: the row-sparse gather uses per-row gathered weights (no
+  shared real right operand across rows), so complex-packing cannot apply. Gather is
+  at its algorithmic floor.

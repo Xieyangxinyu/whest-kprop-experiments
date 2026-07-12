@@ -80,8 +80,8 @@ _PACKED_ROWSPARSE_STOP_LAYER = 29
 _PACKED_ROWSPARSE_CHUNK_ROWS = 16384
 _PACKED_ROWSPARSE_BUCKET = 16
 _PACKED_ROWSPARSE_ROW_BUCKETS = (0, 8, 16, 32, 48, 64, 80, 96, 128, 192)
-_PACKED_ROWSPARSE_MAX_K_NUM = 3
-_PACKED_ROWSPARSE_MAX_K_DEN = 4
+_PACKED_ROWSPARSE_MAX_K_NUM = 1
+_PACKED_ROWSPARSE_MAX_K_DEN = 2
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
 _BLOCK_SPLIT_ROWSPARSE = True
 _BLOCK_SPLIT_FIRE_THRESH = 0.75
@@ -92,7 +92,7 @@ _DENSE_STRASSEN_MIN_ROWS = 4096
 _DENSE_STRASSEN_MIN_IN = 64
 _DENSE_STRASSEN_MIN_OUT = 64
 _COMPLEX_PACK = True
-_COMPLEX_PACK_MIN_ROWS = 256
+_COMPLEX_PACK_MIN_ROWS = 8
 
 
 def _scatter(values, idx, width):
@@ -111,7 +111,7 @@ def _probe_rows(n_samples: int, fraction: float) -> int:
 
 
 def _sample_alpha(x, weights, rows: int):
-    pre = x[:rows, :] @ weights
+    pre = _cpack_matmul(x[:rows, :], weights)
     mean = fnp.mean(pre, axis=0)
     var = fnp.var(pre, axis=0)
     return mean / fnp.sqrt(fnp.maximum(var, 1e-12))

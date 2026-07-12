@@ -1,15 +1,18 @@
-"""Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
+"""Algorithm 20: residual-trimmed packed matmul on the finer-row-buckets surface.
 
-Builds on Algorithm 17 / submission 315824. The single _BLOCK_SPLIT_FIRE_THRESH
-(0.75) is replaced by a per-layer map fitted from a 4-net fire-rate census
-(nets 0-3, mini split): a column firing at rate f costs ~1.94*f per
-row-output in the packed path vs ~1.76 flat in the Strassen dense block, so
-the FLOP crossover sits near f=0.91, not 0.75 - and the optimum is
-layer-dependent because small dense blocks miss the Strassen MIN_IN=64
-discount (layer 31 packs everything). Routing is exact: raw MSE is
-bit-identical; measured flops -0.90% on the fit nets, -0.72% on holdout
-nets 4-12. A global threshold shift is measurably flat - only the per-layer
-map wins.
+Builds on Algorithm 17 / submission 315824. The packed row-sparse matmul is
+restructured to cut grader-charged residual wall time (Python dispatch), with
+bit-identical math:
+- rows are sorted and bucket-split ONCE per call instead of once per chunk
+  (bucket membership depends only on each row's nnz, so groups are
+  chunk-independent and identical to before);
+- all bucket boundaries come from ONE vectorized searchsorted with a single
+  host sync, replacing fourteen per-bucket searchsorted+int() syncs per chunk;
+- memory-safe chunking is retained only INSIDE large groups (same
+  rows x k x width gather ceiling as before);
+- one row-order restore per call instead of one per chunk.
+FLOPs are essentially unchanged (the same per-row gather/einsum work); the
+target is the ~19% of grader effective compute charged as residual.
 
 Original Algorithm 17 header follows.
 Algorithm 17: finer antithetic row buckets for block-split row-sparse propagation.
@@ -79,15 +82,6 @@ _PACKED_ROWSPARSE_MAX_K_DEN = 4
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
 _BLOCK_SPLIT_ROWSPARSE = True
 _BLOCK_SPLIT_FIRE_THRESH = 0.75
-# Per-layer overrides fitted on the nets 0-3 fire-rate census (fire_oracle),
-# holdout-validated on nets 4-12; layers absent here fall back to the default.
-_BLOCK_SPLIT_FIRE_THRESH_BY_LAYER = {
-    2: 0.825, 3: 0.925, 4: 0.95, 5: 0.8, 6: 0.825, 7: 0.825, 8: 0.85,
-    9: 0.875, 10: 0.9, 11: 0.875, 12: 0.9, 13: 0.875, 14: 0.925,
-    15: 0.85, 16: 0.8, 17: 0.9, 18: 0.8, 19: 0.875, 20: 0.925,
-    21: 0.925, 22: 0.925, 23: 0.95, 24: 0.925, 25: 0.9, 26: 0.925,
-    27: 0.95, 28: 0.75, 29: 0.7, 30: 0.8, 31: 1.0,
-}
 _BLOCK_SPLIT_MIN_DENSE_COLS = 32
 _BLOCK_SPLIT_MIN_SPARSE_COLS = 16
 _DENSE_STRASSEN = True
@@ -220,63 +214,54 @@ def _packed_matmul(x, weights, positive_mask=None):
     n_rows = x.shape[0]
     prev_width = weights.shape[0]
     out_width = weights.shape[1]
-    chunks = []
 
-    for start in range(0, n_rows, _PACKED_ROWSPARSE_CHUNK_ROWS):
-        stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
-        x_chunk = x[start:stop, :]
-        chunk_rows = stop - start
-        mask_chunk = positive_mask[start:stop, :] if positive_mask is not None else x_chunk > fnp.float32(0.0)
+    mask = positive_mask if positive_mask is not None else x > fnp.float32(0.0)
+    nnz_per_row = fnp.sum(mask, axis=1)
+    max_nnz = int(fnp.max(nnz_per_row))
+    if max_nnz == 0:
+        return fnp.zeros((n_rows, out_width), dtype=fnp.float32)
 
-        nnz_per_row = fnp.sum(mask_chunk, axis=1)
-        max_nnz = int(fnp.max(nnz_per_row))
-        if max_nnz == 0:
-            chunks.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
+    row_order = fnp.argsort(nnz_per_row)
+    x_sorted = fnp.take(x, row_order, axis=0)
+    mask_sorted = fnp.take(mask, row_order, axis=0)
+    sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
+
+    limits = [limit for limit in _PACKED_ROWSPARSE_ROW_BUCKETS if limit <= prev_width]
+    stops = fnp.searchsorted(sorted_nnz, fnp.array(limits), side="right")
+    stops_host = [int(s) for s in fnp.asarray(stops)]
+
+    sorted_chunks = []
+    group_start = 0
+    for limit, group_stop in zip(limits, stops_host):
+        if group_stop <= group_start:
             continue
-
-        row_order = fnp.argsort(nnz_per_row)
-        x_sorted = fnp.take(x_chunk, row_order, axis=0)
-        mask_sorted = fnp.take(mask_chunk, row_order, axis=0)
-        sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
-        sorted_chunks = []
-        group_start = 0
-        for limit in _PACKED_ROWSPARSE_ROW_BUCKETS:
-            if limit > prev_width:
-                continue
-            group_stop = int(fnp.searchsorted(sorted_nnz, limit, side="right"))
-            if group_stop <= group_start:
-                continue
-
-            x_group = x_sorted[group_start:group_stop, :]
-            group_rows = group_stop - group_start
-            if limit == 0:
-                sorted_chunks.append(fnp.zeros((group_rows, out_width), dtype=fnp.float32))
-            else:
-                k = _ceil_bucket(limit, _PACKED_ROWSPARSE_BUCKET, prev_width)
-                if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
+        if limit == 0:
+            sorted_chunks.append(fnp.zeros((group_stop - group_start, out_width), dtype=fnp.float32))
+        else:
+            k = _ceil_bucket(limit, _PACKED_ROWSPARSE_BUCKET, prev_width)
+            dense_group = k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM
+            for start in range(group_start, group_stop, _PACKED_ROWSPARSE_CHUNK_ROWS):
+                stop = min(group_stop, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
+                x_group = x_sorted[start:stop, :]
+                if dense_group:
                     sorted_chunks.append(_dense_matmul(x_group, weights))
                 else:
-                    mask_group = mask_sorted[group_start:group_stop, :]
+                    mask_group = mask_sorted[start:stop, :]
                     order = fnp.argpartition(mask_group, prev_width - k, axis=1)[:, -k:]
                     values = fnp.take_along_axis(x_group, order, axis=1)
                     gathered_weights = fnp.take(weights, order, axis=0)
                     sorted_chunks.append(fnp.einsum("nk,nko->no", values, gathered_weights))
+        group_start = group_stop
 
-            group_start = group_stop
-            if group_start == chunk_rows:
-                break
+    if group_start < n_rows:
+        for start in range(group_start, n_rows, _PACKED_ROWSPARSE_CHUNK_ROWS):
+            stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
+            sorted_chunks.append(_dense_matmul(x_sorted[start:stop, :], weights))
 
-        if group_start < chunk_rows:
-            sorted_chunks.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
-
-        pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
-        pre_chunk = fnp.empty_like(pre_sorted)
-        fnp.put_along_axis(pre_chunk, row_order[:, None], pre_sorted, axis=0)
-        chunks.append(pre_chunk)
-
-    if len(chunks) == 1:
-        return chunks[0]
-    return fnp.concatenate(chunks, axis=0)
+    pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
+    pre = fnp.empty_like(pre_sorted)
+    fnp.put_along_axis(pre, row_order[:, None], pre_sorted, axis=0)
+    return pre
 
 
 def _packed_relu_matmul(x, weights):
@@ -303,8 +288,7 @@ def _block_split_matmul(x, weights, layer_idx: int):
     if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
         return _packed_matmul(x, weights, positive_mask)
     fire_rate = fnp.mean(positive_mask, axis=0)
-    threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
-    return _split_matmul_with_fire(x, weights, fire_rate, threshold, positive_mask)
+    return _split_matmul_with_fire(x, weights, fire_rate, _BLOCK_SPLIT_FIRE_THRESH, positive_mask)
 
 
 def _block_split_relu_matmul(x, weights, layer_idx: int):
@@ -325,7 +309,7 @@ class Estimator(BaseEstimator):
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
-            data = fnp.load(str(Path(__file__).resolve().parent / "sobol_points.npz"))
+            data = fnp.load(str(Path(__file__).resolve().parent.parent / "sobol_points.npz"))
             self._sobol_points = data["points"]
 
     def _initial_structure(self, mlp: MLP, width: int) -> dict:
@@ -631,3 +615,13 @@ class Estimator(BaseEstimator):
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
         return fnp.stack(combined_rows, axis=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from local_engine import build_mlp, compare_against_monte_carlo
+
+    mlp = build_mlp(width=256, depth=32, seed=0)
+    compare_against_monte_carlo(Estimator(), mlp, estimator_budget=272_000_000_000)

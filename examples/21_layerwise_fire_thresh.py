@@ -325,7 +325,7 @@ class Estimator(BaseEstimator):
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
-            data = fnp.load(str(Path(__file__).resolve().parent / "sobol_points.npz"))
+            data = fnp.load(str(Path(__file__).resolve().parent.parent / "sobol_points.npz"))
             self._sobol_points = data["points"]
 
     def _initial_structure(self, mlp: MLP, width: int) -> dict:
@@ -631,3 +631,13 @@ class Estimator(BaseEstimator):
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
         return fnp.stack(combined_rows, axis=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from local_engine import build_mlp, compare_against_monte_carlo
+
+    mlp = build_mlp(width=256, depth=32, seed=0)
+    compare_against_monte_carlo(Estimator(), mlp, estimator_budget=272_000_000_000)

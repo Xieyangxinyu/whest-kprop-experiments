@@ -53,3 +53,5 @@ submission-*.tar.gz
 relu_moment_propagation.py
 prokpt.txt
 submission.tar.gz
+.ab_*.py
+sobol_points_ext*.npz

@@ -1,0 +1,20 @@
+\section{Introduction}
+
+Randomly initialized ReLU MLPs are simple enough to expose useful mathematical structure, but still complex enough that direct sampling spends most of its computation rediscovering facts that are already visible from the weights. This is closely aligned with ARC's competing-with-sampling and mechanistic-estimation framing \citep{arcCompetingSampling2025,arcWideRandomMlp2026}. The \whest{} task makes this tension explicit: given all weights of an MLP and a compute budget, estimate the mean post-ReLU activation of every neuron under Gaussian input. The leaderboard score is based on the final layer and is multiplied by the fraction of the allowed effective compute that the estimator uses.
+
+The direct Monte Carlo strategy is robust, but it treats every neuron and every sampled path symmetrically. In contrast, a white-box estimator can use the weights to decide which parts of the network are structurally predictable. In a ReLU network, the most useful first-order structural distinction is whether a preactivation is far below zero, far above zero, or close to the activation kink. Far-below neurons contribute almost nothing; far-above neurons are nearly linear; kink neurons are where sampling is most informative. This use of ``dead'' ReLU units is related to the dying-ReLU terminology in optimization, where inactive ReLU neurons output zero across inputs and produce a vanishing-gradient failure mode \citep{lu2020dyingrelu}. Lu et al. also prove a stronger depth-asymptotic statement: under their initialization model, dying ReLUs are inevitable once the network is deep enough, with deep ReLU networks dying in probability as depth tends to infinity. The \whest{} networks here are finite-depth and untrained, but the same forward geometric fact is what makes dead units predictable from the weights.
+
+This submission is therefore deliberately hybrid. Its core is not to replace sampling everywhere, but to use a mechanistic approximation to decide where sampling should be trusted, where it should be avoided, and how sampled activations should be propagated. The estimator first propagates a diagonal Gaussian approximation through the network. It then refines uncertain active sets with a fixed antithetic \sobol{} prefix and spends additional samples only on networks whose analytic final-layer variance proxy predicts higher difficulty. Finally, it turns the resulting ReLU behavior into implementation decisions: dead and on neurons are removed or folded analytically, high-fire columns are routed through dense products, and row-dependent sparse remainders are evaluated by exact packed contractions. This is the implementation-level analogue of ``competing with sampling'': the code is faster because it follows the network's structure rather than treating every sampled coordinate uniformly.
+
+\subsection{Contributions}
+
+The main ingredients of the submitted estimator are as follows.
+
+\begin{enumerate}[leftmargin=*]
+    \item A diagonal moment-propagation pass that classifies neurons into dead, kink, and on regimes, and produces a per-MLP final variance proxy for smooth sample allocation.
+    \item A staged active-set refinement scheme that uses small pilot sample prefixes to correct high-impact classification errors, especially in late layers.
+    \item Network-behavior-driven implementation decisions: exact folds for linear on-neurons, dense matmuls for high-fire columns, and packed gather-einsum contractions for genuinely sparse rows.
+    \item A compute-oriented implementation that keeps these structural operations inside \fnp{} and treats compute reductions as consequences of the same routing decisions.
+\end{enumerate}
+
+This distinction matters for interpretation. The scientific claim is that much of the final-layer mean can be explained by a small set of structural decisions: which neurons are dead, which are effectively linear, which columns are dense, and which sampled paths remain near a kink. The implementation choices described below are included when they follow from those structural decisions, rather than as a separate story about evaluator-specific accounting.

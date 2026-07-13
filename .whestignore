@@ -33,6 +33,7 @@ tests/
 
 # Docs, assets, and project scaffolding
 docs/
+writeup/
 assets/
 scripts/
 Makefile

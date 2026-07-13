@@ -1,0 +1,42 @@
+\pdfoutput=1
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,citecolor=blue,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+
+\input{macros}
+
+\newcommand{\submissionid}{316017}
+
+\title{Structure-Aware Active-Set Estimation for Random ReLU MLPs}
+\author{\begin{tabular}{c}Yangxinyu Xie \quad Natasha Stewart\\[0.4em]Team SOX\end{tabular}}
+\date{ARC WhiteBox Estimation Challenge 2026, Phase 1\\Submission ID: \submissionid}
+
+\begin{document}
+\maketitle
+
+\input{sections/abstract}
+\tableofcontents
+
+\input{sections/introduction}
+\input{sections/problem}
+\input{sections/method}
+\input{sections/results}
+\input{sections/discussion}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

@@ -94,6 +94,18 @@ _DENSE_STRASSEN = True
 _DENSE_STRASSEN_MIN_ROWS = 4096
 _DENSE_STRASSEN_MIN_IN = 64
 _DENSE_STRASSEN_MIN_OUT = 64
+# Algorithm 26: pick the split threshold per call from a normal-approx flop
+# model of the dense+packed routing instead of the fixed per-layer map. The
+# model's cost LEVELS are biased (independent-Bernoulli rows) but the bias is
+# shared across thresholds, so the argmin ranks correctly: on the 100-net mini
+# census it captures 98.4% of the exact per-call oracle (-1.0% total flops).
+_ADAPTIVE_FIRE_THRESH = True
+_ADAPT_TGRID = tuple(round(0.55 + 0.025 * i, 4) for i in range(19))
+_ADAPT_KCEIL = tuple(
+    ((limit + _PACKED_ROWSPARSE_BUCKET - 1) // _PACKED_ROWSPARSE_BUCKET)
+    * _PACKED_ROWSPARSE_BUCKET
+    for limit in _PACKED_ROWSPARSE_ROW_BUCKETS
+)
 
 
 def _scatter(values, idx, width):
@@ -182,74 +194,6 @@ def _strassen_even_matmul(x, weights):
     return fnp.concatenate([top, bottom], axis=0)
 
 
-def _bmean(x2):
-    """Mean over rows of a 2-block sample matrix (blocks are equal halves)."""
-    return (fnp.mean(x2[0], axis=0) + fnp.mean(x2[1], axis=0)) * fnp.float32(0.5)
-
-
-def _dense_matmul_2blk(x2, weights):
-    """Dense matmul on a row-blocked (top, bottom) pair, returned UNASSEMBLED.
-
-    The pipeline block boundary (antithetic half) IS the one-level Strassen
-    row split, so the quadrant products are byte-for-byte the ones the
-    unblocked `_strassen_even_matmul` computes — but the axis=0 output
-    assembly concat (the largest single grader-priced copy in the census,
-    1.15 GB/net) never happens. Guards replicate `_dense_matmul` on the
-    COMBINED row count; n is always even here (antithetic pairs), so the
-    odd-row bottom branch cannot fire.
-    """
-    xt, xb = x2
-    row_count = xt.shape[0] + xb.shape[0]
-    in_width = weights.shape[0]
-    out_width = weights.shape[1]
-    if (
-        not _DENSE_STRASSEN
-        or row_count < _DENSE_STRASSEN_MIN_ROWS
-        or in_width < _DENSE_STRASSEN_MIN_IN
-        or out_width < _DENSE_STRASSEN_MIN_OUT
-    ):
-        return xt @ weights, xb @ weights
-    core_in = in_width - (in_width % 2)
-    core_out = out_width - (out_width % 2)
-    if core_in < _DENSE_STRASSEN_MIN_IN or core_out < _DENSE_STRASSEN_MIN_OUT:
-        return xt @ weights, xb @ weights
-
-    half_in = core_in // 2
-    half_out = core_out // 2
-    x11 = xt[:, :half_in]
-    x12 = xt[:, half_in:core_in]
-    x21 = xb[:, :half_in]
-    x22 = xb[:, half_in:core_in]
-    w11 = weights[:half_in, :half_out]
-    w12 = weights[:half_in, half_out:core_out]
-    w21 = weights[half_in:core_in, :half_out]
-    w22 = weights[half_in:core_in, half_out:core_out]
-
-    prod1 = (x11 + x22) @ (w11 + w22)
-    prod2 = (x21 + x22) @ w11
-    prod3 = x11 @ (w12 - w22)
-    prod4 = x22 @ (w21 - w11)
-    prod5 = (x11 + x12) @ w22
-    prod6 = (x21 - x11) @ (w11 + w12)
-    prod7 = (x12 - x22) @ (w21 + w22)
-
-    out11 = prod1 + prod4 - prod5 + prod7
-    out12 = prod3 + prod5
-    out21 = prod2 + prod4
-    out22 = prod1 - prod2 + prod3 + prod6
-
-    top = fnp.concatenate([out11, out12], axis=1)
-    bottom = fnp.concatenate([out21, out22], axis=1)
-
-    if core_in < in_width:
-        top = top + (xt[:, core_in:] @ weights[core_in:, :core_out])
-        bottom = bottom + (xb[:, core_in:] @ weights[core_in:, :core_out])
-    if core_out < out_width:
-        top = fnp.concatenate([top, xt @ weights[:, core_out:]], axis=1)
-        bottom = fnp.concatenate([bottom, xb @ weights[:, core_out:]], axis=1)
-    return top, bottom
-
-
 def _dense_matmul(x, weights):
     row_count = x.shape[0]
     in_width = weights.shape[0]
@@ -288,16 +232,7 @@ def _packed_matmul(x, weights, positive_mask=None):
     n_rows = x.shape[0]
     prev_width = weights.shape[0]
     out_width = weights.shape[1]
-    # Concat-minimized assembly: group outputs from ALL chunks are collected
-    # and concatenated ONCE, then row order is restored with a single global
-    # inverse-permutation gather (fnp.take). vs the shipped form this halves
-    # the packed concat bytes (no per-chunk group concat AND chunk concat)
-    # and drops the per-chunk empty_like+put_along_axis scatter (proven
-    # grader-free by 316368, but the gather also removes ~230 backend
-    # ops/net). Per-row values are unchanged; only fallback-group Strassen
-    # eligibility can shift with chunk boundaries (fp-noise class).
-    all_groups = []
-    chunk_orders = []
+    chunks = []
 
     for start in range(0, n_rows, _PACKED_ROWSPARSE_CHUNK_ROWS):
         stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
@@ -308,16 +243,14 @@ def _packed_matmul(x, weights, positive_mask=None):
         nnz_per_row = fnp.sum(mask_chunk, axis=1)
         max_nnz = int(fnp.max(nnz_per_row))
         if max_nnz == 0:
-            all_groups.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
-            # all-zero rows are interchangeable: any permutation restores them
-            chunk_orders.append(fnp.argsort(nnz_per_row) + start)
+            chunks.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
             continue
 
         row_order = fnp.argsort(nnz_per_row)
         x_sorted = fnp.take(x_chunk, row_order, axis=0)
         mask_sorted = fnp.take(mask_chunk, row_order, axis=0)
         sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
-        sorted_chunks = all_groups  # group outputs accumulate globally
+        sorted_chunks = []
         group_start = 0
         for limit in _PACKED_ROWSPARSE_ROW_BUCKETS:
             if limit > prev_width:
@@ -348,56 +281,121 @@ def _packed_matmul(x, weights, positive_mask=None):
         if group_start < chunk_rows:
             sorted_chunks.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
 
-        chunk_orders.append(row_order + start)
+        pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
+        pre_chunk = fnp.empty_like(pre_sorted)
+        fnp.put_along_axis(pre_chunk, row_order[:, None], pre_sorted, axis=0)
+        chunks.append(pre_chunk)
 
-    full_sorted = all_groups[0] if len(all_groups) == 1 else fnp.concatenate(all_groups, axis=0)
-    global_order = chunk_orders[0] if len(chunk_orders) == 1 else fnp.concatenate(chunk_orders)
-    return fnp.take(full_sorted, fnp.argsort(global_order), axis=0)
+    if len(chunks) == 1:
+        return chunks[0]
+    return fnp.concatenate(chunks, axis=0)
 
 
-def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float, masks2):
-    """Row-blocked split matmul: the column split (from the COMBINED fire
-    rate) is shared by both blocks; the dense part runs through the
-    unassembled 2-block Strassen; the packed part runs per block (rows are
-    independent). Returns (top, bottom)."""
+def _packed_relu_matmul(x, weights):
+    return fnp.maximum(_packed_matmul(x, weights), 0.0)
+
+
+def _split_matmul_with_fire(x, weights, fire_rate, threshold: float, positive_mask=None):
     dense_pos = fnp.nonzero(fire_rate >= fnp.float32(threshold))[0]
     sparse_pos = fnp.nonzero(fire_rate < fnp.float32(threshold))[0]
 
     if len(dense_pos) < _BLOCK_SPLIT_MIN_DENSE_COLS or len(sparse_pos) < _BLOCK_SPLIT_MIN_SPARSE_COLS:
-        return (
-            _packed_matmul(x2[0], weights, masks2[0]),
-            _packed_matmul(x2[1], weights, masks2[1]),
-        )
+        return _packed_matmul(x, weights, positive_mask)
 
+    x_dense = fnp.take(x, dense_pos, axis=1)
     w_dense = fnp.take(weights, dense_pos, axis=0)
+    x_sparse = fnp.take(x, sparse_pos, axis=1)
     w_sparse = fnp.take(weights, sparse_pos, axis=0)
-    dense_t, dense_b = _dense_matmul_2blk(
-        (fnp.take(x2[0], dense_pos, axis=1), fnp.take(x2[1], dense_pos, axis=1)), w_dense
-    )
-    packed_t = _packed_matmul(
-        fnp.take(x2[0], sparse_pos, axis=1), w_sparse, fnp.take(masks2[0], sparse_pos, axis=1)
-    )
-    packed_b = _packed_matmul(
-        fnp.take(x2[1], sparse_pos, axis=1), w_sparse, fnp.take(masks2[1], sparse_pos, axis=1)
-    )
-    return dense_t + packed_t, dense_b + packed_b
+    sparse_mask = None if positive_mask is None else fnp.take(positive_mask, sparse_pos, axis=1)
+    return _dense_matmul(x_dense, w_dense) + _packed_matmul(x_sparse, w_sparse, sparse_mask)
 
 
-def _block_split_matmul_2blk(x2, weights, layer_idx: int):
-    masks2 = (x2[0] > fnp.float32(0.0), x2[1] > fnp.float32(0.0))
-    if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
-        return (
-            _packed_matmul(x2[0], weights, masks2[0]),
-            _packed_matmul(x2[1], weights, masks2[1]),
+def _adaptive_fire_thresh(fire_rate, n_rows: int, prev_w: int, out_w: int) -> float:
+    """Grid-argmin of the modeled split cost for this call. All arithmetic in
+    float32: cost magnitudes (~4e10) overflow int32, and float32's ~1e-7
+    relative error cannot flip an argmin whose competing costs differ by more.
+    Indices (searchsorted/take) stay integer."""
+    fire_sorted = fnp.sort(fire_rate)
+    pad = fnp.zeros(1, dtype=fnp.float32)
+    cumfire = fnp.concatenate([pad, fnp.cumsum(fire_sorted)])
+    cumvar = fnp.concatenate([pad, fnp.cumsum(fire_sorted * (1.0 - fire_sorted))])
+
+    tgrid = fnp.array(_ADAPT_TGRID, dtype=fnp.float32)
+    s_idx = fnp.searchsorted(fire_sorted, tgrid)  # columns with fire < t
+    s = s_idx * 1.0
+    d = prev_w - s
+    split = (d >= _BLOCK_SPLIT_MIN_DENSE_COLS) & (s >= _BLOCK_SPLIT_MIN_SPARSE_COLS)
+    s_eff_idx = fnp.where(split, s_idx, prev_w)
+    s_eff = s_eff_idx * 1.0
+    mu = fnp.take(cumfire, s_eff_idx)
+    sd = fnp.sqrt(fnp.maximum(fnp.take(cumvar, s_eff_idx), 1e-12))
+
+    n_f, o_f = float(n_rows), float(out_w)
+    dense_plain = (n_f * o_f) * (2.0 * d - 1.0)
+    m2 = float(n_rows - n_rows % 2)
+    o2 = float(out_w - out_w % 2)
+    if n_rows >= _DENSE_STRASSEN_MIN_ROWS and o2 >= _DENSE_STRASSEN_MIN_OUT:
+        d2 = fnp.floor(d / 2.0) * 2.0
+        dcore = (
+            (d2 / 2.0) * (5.0 * (m2 / 2))
+            + (d2 / 2.0) * (5.0 * (o2 / 2))
+            + (2.0 * (d2 / 2.0) - 1.0) * (7.0 * (m2 / 2) * (o2 / 2))
+            + 8.0 * (m2 / 2) * (o2 / 2)
+            + fnp.where(d2 < d, 2.0 * m2 * o2, 0.0)
+            + ((2.0 * d - 1.0) * (m2 * (out_w - o2)) if o2 < out_w else 0.0)
+            + ((2.0 * d - 1.0) * ((n_rows - m2) * out_w) if m2 < n_rows else 0.0)
         )
-    fire_rate = (fnp.mean(masks2[0], axis=0) + fnp.mean(masks2[1], axis=0)) * fnp.float32(0.5)
-    threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
-    return _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold, masks2)
+        strass = split & (d2 >= _DENSE_STRASSEN_MIN_IN)
+        dense_c = fnp.where(split, fnp.where(strass, dcore, dense_plain), 0.0)
+    else:
+        dense_c = fnp.where(split, dense_plain, 0.0)
+
+    limits = fnp.array(_PACKED_ROWSPARSE_ROW_BUCKETS, dtype=fnp.float32)
+    kceil = fnp.array(_ADAPT_KCEIL, dtype=fnp.float32)
+    usable = limits[None, :] <= s_eff[:, None]
+    z = (limits[None, :] + 0.5 - mu[:, None]) / sd[:, None]
+    cdf = flops.stats.norm.cdf(z)
+    cdf_u = fnp.where(usable, cdf, 0.0)
+    prev = fnp.concatenate(
+        [fnp.zeros((len(_ADAPT_TGRID), 1), dtype=fnp.float32), cdf_u[:, :-1]], axis=1
+    )
+    p = fnp.clip(fnp.where(usable, cdf - prev, 0.0), 0.0, 1.0)
+    k = fnp.minimum(kceil[None, :], s_eff[:, None])
+    fallback = k * float(_PACKED_ROWSPARSE_MAX_K_DEN) > s_eff[:, None] * float(
+        _PACKED_ROWSPARSE_MAX_K_NUM
+    )
+    per_row_einsum = (2.0 * k - 1.0) * o_f + s_eff[:, None]
+    per_row_dense = (2.0 * s_eff[:, None] - 1.0) * o_f
+    bucket_c = fnp.where(
+        limits[None, :] == 0.0, 0.0, fnp.where(fallback, per_row_dense, per_row_einsum)
+    )
+    tail_p = fnp.clip(1.0 - fnp.max(cdf_u, axis=1), 0.0, 1.0)
+    packed_c = (
+        (fnp.sum(p * bucket_c, axis=1) + tail_p * (2.0 * s_eff - 1.0) * o_f) * n_f
+        + (s_eff - 1.0) * n_f
+        + 12.0 * n_f
+    )
+
+    total = dense_c + packed_c + fnp.where(split, n_f * o_f, 0.0)
+    return _ADAPT_TGRID[int(fnp.argmin(total))]
 
 
-def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int):
-    top, bottom = _block_split_matmul_2blk(x2, weights, layer_idx)
-    return fnp.maximum(top, 0.0), fnp.maximum(bottom, 0.0)
+def _block_split_matmul(x, weights, layer_idx: int):
+    positive_mask = x > fnp.float32(0.0)
+    if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
+        return _packed_matmul(x, weights, positive_mask)
+    fire_rate = fnp.mean(positive_mask, axis=0)
+    if _ADAPTIVE_FIRE_THRESH:
+        threshold = _adaptive_fire_thresh(
+            fire_rate, x.shape[0], weights.shape[0], weights.shape[1]
+        )
+    else:
+        threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
+    return _split_matmul_with_fire(x, weights, fire_rate, threshold, positive_mask)
+
+
+def _block_split_relu_matmul(x, weights, layer_idx: int):
+    return fnp.maximum(_block_split_matmul(x, weights, layer_idx), 0.0)
 
 
 class Estimator(BaseEstimator):
@@ -483,7 +481,7 @@ class Estimator(BaseEstimator):
                 f"but this estimator needs {end_half}."
             )
         half = fnp.array(self._sobol_points[start_half:end_half, :width])
-        return half, -half
+        return fnp.concatenate([half, -half], axis=0)
 
     def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
         width = mlp.width
@@ -506,7 +504,7 @@ class Estimator(BaseEstimator):
 
             if len(idx) == 0:
                 mc_rows.append(fnp.zeros(width))
-                x = (fnp.zeros((n_samples // 2, 0)), fnp.zeros((n_samples // 2, 0)))
+                x = fnp.zeros((n_samples, 0))
                 prev_idx = idx
                 x_before_fold = None
                 continue
@@ -522,7 +520,7 @@ class Estimator(BaseEstimator):
                 if len(probe_kink_idx) > 0:
                     w_kink_probe = w[prev_idx, :][:, probe_kink_idx]
                     kept_probe_kink_idx, demoted_kink_idx = _staged_threshold_split(
-                        probe_kink_idx, x[0], w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
+                        probe_kink_idx, x, w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
                     )
                 else:
                     kept_probe_kink_idx = kink_idx[:0]
@@ -549,7 +547,7 @@ class Estimator(BaseEstimator):
                     if len(probe_on_idx) > 0:
                         w_on_probe = w[prev_idx, :][:, probe_on_idx]
                         kept_probe_on_idx, demoted_idx = _staged_threshold_split(
-                            probe_on_idx, x[0], w_on_probe, n_samples, _PILOT_ON_THRESH
+                            probe_on_idx, x, w_on_probe, n_samples, _PILOT_ON_THRESH
                         )
                     else:
                         demoted_idx = on_idx[:0]
@@ -568,7 +566,7 @@ class Estimator(BaseEstimator):
                         if len(probe_dead_idx) > 0:
                             w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                             promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                                probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                                probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                             )
                         else:
                             promoted_idx = dead_idx[:0]
@@ -586,10 +584,10 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                x_kink = _block_split_relu_matmul_2blk(x, w_kink, layer_idx)
-                kink_mean = _bmean(x_kink)
+                x_kink = _block_split_relu_matmul(x, w_kink, layer_idx)
+                kink_mean = fnp.mean(x_kink, axis=0)
 
-                mean_prev = _bmean(x)
+                mean_prev = fnp.mean(x, axis=0)
                 w_on = w[prev_idx, :][:, on_idx]
                 on_mean = mean_prev @ w_on
 
@@ -604,19 +602,16 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                pre_from_kink = _block_split_matmul_2blk(x, w_from_kink, layer_idx)
+                pre_from_kink = _block_split_matmul(x, w_from_kink, layer_idx)
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
                 w_this_from_on = w[fold_on_idx, :][:, kink_idx]
                 w_folded = w_fold_on @ w_this_from_on
-                pre_from_on = _dense_matmul_2blk(x_before_fold, w_folded)
+                pre_from_on = _dense_matmul(x_before_fold, w_folded)
 
-                x_kink = (
-                    fnp.maximum(pre_from_kink[0] + pre_from_on[0], 0.0),
-                    fnp.maximum(pre_from_kink[1] + pre_from_on[1], 0.0),
-                )
-                kink_mean = _bmean(x_kink)
+                x_kink = fnp.maximum(pre_from_kink + pre_from_on, 0.0)
+                kink_mean = fnp.mean(x_kink, axis=0)
 
                 prev_layer_mean = mc_rows[30]
                 fold_active_idx = active_indices[30]
@@ -642,7 +637,7 @@ class Estimator(BaseEstimator):
                     if len(probe_dead_idx) > 0:
                         w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                         promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                            probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                            probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                         )
                     else:
                         promoted_idx = dead_idx[:0]
@@ -662,8 +657,8 @@ class Estimator(BaseEstimator):
             if prev_idx is None:
                 w_active = w[:, idx]
                 half_rows = n_samples // 2
-                pre_half = _dense_matmul(x[0][:half_rows, :], w_active)
-                x = (fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0))
+                pre_half = _dense_matmul(x[:half_rows, :], w_active)
+                x = fnp.concatenate([fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0)], axis=0)
             else:
                 w_active = w[prev_idx, :][:, idx]
                 if (
@@ -672,17 +667,13 @@ class Estimator(BaseEstimator):
                     and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
                 ):
                     if _BLOCK_SPLIT_ROWSPARSE:
-                        x = _block_split_relu_matmul_2blk(x, w_active, layer_idx)
+                        x = _block_split_relu_matmul(x, w_active, layer_idx)
                     else:
-                        x = (
-                            fnp.maximum(_packed_matmul(x[0], w_active), 0.0),
-                            fnp.maximum(_packed_matmul(x[1], w_active), 0.0),
-                        )
+                        x = _packed_relu_matmul(x, w_active)
                 else:
-                    dt, db = _dense_matmul_2blk(x, w_active)
-                    x = (fnp.maximum(dt, 0.0), fnp.maximum(db, 0.0))
+                    x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
             if _MATERIALIZE_INTERMEDIATE_ROWS or layer_idx >= 30:
-                mc_rows.append(_scatter(_bmean(x), idx, width))
+                mc_rows.append(_scatter(fnp.mean(x, axis=0), idx, width))
             else:
                 mc_rows.append(fnp.zeros(width))
             prev_idx = idx

@@ -338,6 +338,105 @@ Baselines for comparison:
   time IS the grader's residual meter; anything that blocks Python per
   call - measurement OR routing - pays for itself at lambda.
 
+### Submission 316416 - Algorithm 28 reproducibility check (byte-identical resubmit)
+
+- Result: FAILED — "could not complete" (submitted 00:44:59Z Jul 15,
+  healthy queue). Same artifact graded 10m51s earlier (316405) and now
+  died — we sit at ~11 min vs the ~15-min deadline, inside the
+  worker-speed roulette band. Score reproduction NOT yet confirmed;
+  artifact-identity is proven by sha, not by regrade.
+- The 15-min limit is NOT documented client-side (limits.py and docs
+  have no total-job constant) — it is an empirical grader/platform
+  property from 3 timing points. Worth asking organizers.
+
+### Yangxinyu Algorithm-25 (row-dense fallback) re-evaluated on algo28
+
+- Graded prior evidence: 316005 vs 315998 = -0.32% adjusted at identical
+  raw on the c64 surface — REAL but 20x below its local -7.6% signal.
+  Since its flops were ~neutral, that -0.33% multiplier prices op-count:
+  ~470 fewer backend ops/net -> ~7e5 FLOP-eq PER OP. First graded
+  dispatch-price point; implies our ~9k wrapped ops/net ~ half the
+  1.2e10 residual, and implies the ~113 per-chunk int(fnp.max) host
+  pulls/net (~5,700/job) may account for MOST of our ~11-min job wall.
+- Port to algo28 (estimator_rowdense.py), 8-net A/B:
+  - cleanups (drop bucket-8, Strassen immediate-accumulate, half-only
+    sample load): BIT-IDENTICAL 8/8, flops -0.0072%, -160 ops/net.
+    ADOPT-candidate (free, ~-0.1%-class via op pricing).
+  - MAX_K 3/4 -> 1/2 row-dense fallback: flops +7.19% on the honest fp32
+    surface (their surface's complex-cost pricing made dense fallback
+    ~free; ours prices it fully). REJECT - net ~+6.8% adjusted.
+
+### Submission 316417 - Algorithm 29b (sync-batch + exact cleanups)
+
+- Result: still grading (submitted 01:32:30Z Jul 15; queue quiet, no
+  adverse health signal)
+- Change vs 316405: (1) removed the per-chunk int(fnp.max) host sync
+  (dead all-zero short-circuit; the limit-0 group handles it exactly);
+  (2) ONE vectorized searchsorted + one tolist() pull per chunk replaces
+  ~13 int() syncs (conservative per-element fallback if RemoteArray
+  lacks tolist); (3) Yangxinyu cleanups: bucket-8 drop, Strassen
+  immediate-accumulate, half-only sample load. Their MAX_K 1/2 row-dense
+  fallback EXCLUDED (+7.19% flops on honest pricing).
+- Gates: BIT-IDENTICAL 8/8 nets vs algo28 (raw byte-equal through the
+  packaged artifact: subprocess 4.269141508454292e-07 exact); flops
+  -0.0089%; host syncs 950 -> 124/net (-826); validate, validate-package,
+  extracted-validate, subprocess flags all clean; artifact sha c6b4a836.
+- Pre-registered read: adjusted -0.5..-1% if the 316005 op-price
+  (~7e5 FLOP-eq/op) holds for syncs; job runtime should DROP vs 316405's
+  10m51s (sync latency savings, magnitude unknown) - the runtime is
+  itself a measurement of grader sync latency: (10m51s - t_29b)/826
+  syncs/net. Failure would be deadline roulette, not artifact (bit-
+  identical math to a graded surface).
+- Result: FAILED at ~15m12s — the deadline again (3rd consecutive:
+  316416 15m34s, 316417 15m12s, vs 316405's 10m51s success this
+  afternoon). Two inferences: (1) per-sync latency on the
+  searchsorted/max class must be SMALL (~2-5ms, not 90ms — at 90ms the
+  baseline's 47,500 syncs/job could never have finished in 10m51s;
+  algo29's death was likely the argmin pipeline-FLUSH semantics, not
+  scalar-pull latency), so the -826 syncs/net bought little TIME (its
+  ~-0.5-1% PRICING value per 316005 remains plausible but ungraded);
+  (2) tonight's workers are running ~40%+ slower than this afternoon's
+  — time-of-day load. The deadline case for organizers is now
+  overwhelming: 4 deadline deaths incl. a byte-identical pair
+  (316405 graded / 316416 failed).
+- Decision: STOP submitting tonight (3 consecutive deadline deaths =
+  the current window is hostile to our ~11-min runtime class). Retry
+  29b in a morning window (316260/315892-era submissions all graded in
+  mornings). Score-free runtime cuts are now essentially exhausted:
+  the remaining ~6 min/job is einsum gather + matmul backend compute,
+  reducible only by paying flops. Escalate the 15-min limit to
+  organizers with the identical-artifact pair as the exhibit.
+
+## Runtime model rev 3 + insurance sizing (Jul 15 early, user panel data)
+
+- User-read per-net panel (our submission): WALL 32.0-44.4s/net, mean
+  ~37s, flops 6.6e10-1.04e11. Sum ~31 min over 50 nets vs 10m51s job =>
+  grader runs BATCHES OF 5 (user-confirmed): job ~ 10 waves x max(wall
+  of 5). ~31% of nets exceed rule-N 49152 => ~84% of waves are
+  tail-paced. Grader per-WORKER speed ~2.3x slower than local laptop
+  (corrects the "grader ~ local" note - that was parallelism masking).
+- RULES QUOTE (user): "60-second hard wall-clock cap per MLP - zero-
+  prediction fallback (S5.5)". Tail nets at 44.4s cross 60s on a 1.35x
+  slow worker => silent per-net score craters are a SECOND slow-night
+  risk besides the ~15-min batch limit (still undocumented).
+- Insurance sweep (census-exact + fleet A/Bs, all on the 29b surface):
+  - dense-gate 3/4->2/3: MIRAGE (-0.1% gather; occupancy sits at
+    k<=0.63s). Gate knob dead at any useful size.
+  - full trim (anchor 40960 + cap 49152): flops -14.7%, local wall
+    -16.4%, fleet raw +22.2% (32 nets) => projected adjusted ~+4.2%.
+    DOMINATED - drop.
+  - cap-only 49152 (= 29c): affected nets 10/32; on them raw +17.4%,
+    flops -16.3% => per-net adjusted product ~0.98 (score ~NEUTRAL,
+    N-flatness measured); fleet ~ -0.6%..+0.5%. Tail wall 44->~36s
+    (slow-worker ~50s < 60 cap), batch ~12.5-13 min on slow workers.
+- DECISION QUEUE: 29c = the insurance submission (score-neutral,
+  reliability-positive); 29b full-N = the frontier attempt for healthy
+  windows. Both need user go per the submission gate rule.
+- "Why are others faster": leaders spend 2.8x less effective compute
+  AND run GEMM-speed dense paths; our packed gather/einsum machinery is
+  90% of wall at ~10-20 GFLOP/s effective, buying the ~25% flop
+  discount (~15-20% of score). Slowness is earned, not waste.
+
 ## Evaluator-failure forensics (20:30Z, "why do our submissions keep failing")
 
 Timing facts:

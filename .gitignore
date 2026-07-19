@@ -33,5 +33,8 @@ Thumbs.db
 .claude/worktrees/
 .playwright-mcp/
 
+# Generated benchmark data
+bench_logs/sample_diagnostics/
+
 # Internal process docs (specs, plans, scratch) — not for participant repo.
 .aicrowd/

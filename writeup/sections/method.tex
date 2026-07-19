@@ -1,0 +1,87 @@
+\section{Method}
+
+\subsection{Mechanism 1: Dead, Kink, and On Regimes}
+
+The first mechanistic decision is to stop treating all neurons as equally sampled objects. A ReLU neuron is computationally simple when its preactivation stays on one side of zero: if it is always below zero, its post-ReLU output is dead; if it is always above zero, ReLU is the identity and the neuron is linear; only neurons near the kink need sampled nonlinear propagation. These regimes imply different computations. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. On neurons are treated as linear, since \(\relu(z)=z\) throughout the sampled region. Kink neurons remain sampled because their ReLU mask changes across samples and is where the nonlinear estimation problem lives.
+
+This split is visible directly from Monte Carlo activations. On a representative random MLP, neurons increasingly separate into always-off, near-kink, and always-on populations with depth (\Cref{fig:layer-collapse-classification}). The estimator uses this fact in two ways. First, it prunes dead columns from the sampled state and propagates only active indices. Second, in the final two layers it folds layer-30 on-neurons through the next weight matrix. The fold is algebraic: if neuron \(i\) is on at layer 30, then \(x_{30,i}=z_{30,i}=(x_{29}W_{30})_i\) sample by sample, so its contribution to a layer-31 preactivation can be composed through \(W_{30}\) and \(W_{31}\) without materializing that sampled column. Layer-30 kink neurons do not satisfy this identity, so their contribution remains sampled.
+
+The boundary between these regimes is the main failure mode of a hard classifier. On neurons near a decision boundary, the estimator performs staged pilot checks: a small prefix estimates the sign regime, and an uncertain band is rechecked with a larger prefix before promoting or demoting the neuron. This is particularly important near layers 30 and 31, where late classification mistakes directly affect the scored layer.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/layer_collapse_neuron_classification.png}
+    \caption{Monte Carlo diagnostic from the layer-collapse notebook. Neurons are classified by their preactivation range over 20k samples: always-off neurons never fire, always-on neurons pass linearly through ReLU, and near-kink neurons still require sampled nonlinear propagation. The always-on population grows with depth as the representation collapses toward lower effective rank.}
+    \label{fig:layer-collapse-classification}
+\end{figure}
+
+\subsection{Estimating the Regimes with a Diagonal Gaussian Pass}
+
+The regime split must be predicted from the weights before spending most of the sampling budget. The estimator does this with a diagonal Gaussian pass that approximates the preactivation distribution at each layer by independent Gaussians, using the same closed-form ReLU Gaussian moments that appear in assumed-density filtering for Bayesian neural networks \citep{ghosh2016adf}. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
+\begin{align}
+    \mu_{\ell,j}^{\rm pre} &= \sum_i W_{\ell,ij}\mu_{\ell-1,i}, \\
+    (\sigma_{\ell,j}^{\rm pre})^2 &= \sum_i W_{\ell,ij}^2 v_{\ell-1,i}.
+\end{align}
+Writing $\alpha_{\ell,j}=\mu_{\ell,j}^{\rm pre}/\sigma_{\ell,j}^{\rm pre}$ and denoting the standard normal density and CDF by $\phi$ and $\Phi$, the Gaussian ReLU moment update is
+\begin{align}
+    \mu_{\ell,j}
+    &= \mu_{\ell,j}^{\rm pre}\Phi(\alpha_{\ell,j})
+       + \sigma_{\ell,j}^{\rm pre}\phi(\alpha_{\ell,j}), \\
+    v_{\ell,j}
+    &= \left((\sigma_{\ell,j}^{\rm pre})^2+(\mu_{\ell,j}^{\rm pre})^2\right)\Phi(\alpha_{\ell,j})
+       + \mu_{\ell,j}^{\rm pre}\sigma_{\ell,j}^{\rm pre}\phi(\alpha_{\ell,j})
+       - \mu_{\ell,j}^2.
+\end{align}
+This pass is used in two ways. First, it classifies neurons by their normalized preactivation: dead if $\alpha<-3$, on if $\alpha>3$, and kink otherwise. Second, the final diagonal variance proxy controls the number of samples assigned to the MLP,
+\begin{align}
+    N = \clip\left(2\cdot\mathrm{round}\left(\frac{49152}{2}\sqrt{\frac{\bar v_L}{0.02143}}\right),
+    30720,61440\right).
+\end{align}
+This allocation is another consequence of the same regime view. The working hypothesis is that MLPs whose final layers contain larger active, high-magnitude neurons are harder in the absolute final-layer MSE sense: finite sampling errors on those neurons cost more than comparable relative errors on small or dead neurons. A direct sampling diagnostic supports this metric-level asymmetry: in a matched random MLP, the top $10\%$ of final neurons by mean magnitude carry about half of the expected final-layer sampling variance, and the top $20\%$ carry about $72\%$ (\Cref{fig:final-magnitude-sampling-difficulty}). The allocation is intentionally smooth. Earlier bucketed or mini-tuned allocations produced local wins but were less reliable on the public evaluator.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/final_magnitude_sampling_difficulty.png}
+    \caption{Empirical support for the sample-allocation proxy on a matched random ReLU MLP. Under plain Monte Carlo, each neuron's contribution to expected final-layer MSE is proportional to its activation variance divided by sample count. High-magnitude active final neurons carry most of this absolute sampling cost, so a final-layer variance proxy is a natural signal for allocating more samples to harder MLPs.}
+    \label{fig:final-magnitude-sampling-difficulty}
+\end{figure}
+
+\subsection{Mechanism 2: Activation-Matrix Dense/Sparse Split}
+
+The dead/kink/on split decides which neuron columns remain in the sampled computation. The second mechanistic decision is how to multiply the surviving sampled activation matrix. Sorting each layer's sampled post-ReLU design matrix by column firing rate makes the computational structure visible (\Cref{fig:activation-design-matrix}). Dead columns are blank, high-fire columns are dense across sample rows, and the middle columns form a row-dependent sparse block. A complementary covariance view shows the rank-collapse backdrop: late-layer covariance concentrates into a small active core surrounded by sparse or nearly diagonal structure (\Cref{fig:covariance-block-waterfall}). These diagnostics motivate a concrete implementation rule: route high-fire columns to dense matmul and route the remaining sparse block to exact row-sparse contractions.
+
+For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithetic pairing. The \sobol{} sequence is a standard low-discrepancy variance-reduction ingredient, not a unique contribution of this submission \citep{sobol1967distribution}. The antithetic pair uses the Gaussian symmetry $z\mapsto -z$, a classical way to encourage cancellation between paired Monte Carlo evaluations \citep[Section~8.2]{owen2013montecarlo}. Related randomized-QMC approaches were also discussed by other challenge participants, including randomized lattice/Sobol comparisons and Rao-Blackwellization for post-ReLU activation means \citep{aicrowdRqmcRaoBlackwell2026}. Only half of the Gaussianized points are stored; the first-layer symmetry reconstructs the paired activations exactly after the first matmul. The base block uses $30720$ effective samples. Harder MLPs continue with the next \sobol{} prefix up to $61440$ samples.
+
+\begin{figure}[p]
+    \centering
+    \includegraphics[width=\linewidth]{figures/layer_collapse_activation_design_matrix.png}
+    \caption{Sample activation design matrices for selected layers of the same diagnostic MLP. Each row is a Gaussian input sample, each column is a neuron, and columns are sorted by firing rate. The top ribbon marks the routing class used for visualization: always-off/dead columns, sparse middle columns, and high-fire dense columns. This picture motivates the estimator's dense/sparse split: dense columns are cheaper as a dense block, while the sparse middle block benefits from row-sparse packing.}
+    \label{fig:activation-design-matrix}
+\end{figure}
+
+\begin{figure}[p]
+    \centering
+    \includegraphics[width=\linewidth]{figures/relu_covariance_block_waterfall.png}
+    \caption{Post-ReLU covariance matrices reordered by dead, near-identity, sparse, and dense blocks across depth in a matched random ReLU MLP. The plot is a rank-collapse diagnostic: the dense correlated core becomes visually distinct in later layers, while a larger sparse tier remains. It supports the same late-layer structural story as the layer-collapse figures, but the fold itself follows from the exact layer-30 always-on linearity condition.}
+    \label{fig:covariance-block-waterfall}
+\end{figure}
+
+\subsection{Exact Row-Sparse Propagation}
+
+The sampled active matrix is sparse after ReLU, but the sparsity pattern is row-dependent. For a sampled activation matrix $X\in\R^{n\times d}$ and weights $W\in\R^{d\times d'}$, each sample row has support
+\begin{align}
+    S_r = \{i: X_{ri}>0\}.
+\end{align}
+When $|S_r|$ is small, the product $XW$ can be evaluated exactly by gathering only the active entries and their corresponding weight rows. Rows with similar nonzero counts are bucketed, padded to a bucket size, and contracted by
+\begin{align}
+    Y_{ro} = \sum_{t=1}^{k_r} X_{r,i_{rt}} W_{i_{rt},o}.
+\end{align}
+In code this is a packed \texttt{einsum} over gathered values and gathered weights. For high-density rows, the estimator falls back to dense matmul because the gather overhead and larger sparse contraction no longer pay for themselves.
+
+Column firing rates provide a second split. Columns that fire frequently are routed into a dense block; low-fire columns remain in the packed sparse block. The submitted artifact used a global fire threshold of $0.5$, selected because it gave the best raw-MSE-preserving compute tradeoff in local public-mini checks. This was not an accuracy change: it rerouted the same sampled computation to reduce effective compute.
+
+\subsection{Implementation Decisions from Network Behavior}
+
+The implementation choices above are not incidental accelerations; they are the computational form of the structural picture. The estimator first asks what role each sampled coordinate plays in the ReLU network, then chooses the corresponding numerical primitive. Dead neurons are filled analytically, on-neurons are folded as linear maps, high-fire columns are treated as dense blocks, and the remaining rows are evaluated by exact sparse contractions. In this sense the implementation follows the same spirit as competing with sampling: it reduces compute by using white-box facts about the circuit being estimated.
+
+One lower-level choice then makes these structurally chosen products cheaper: large dense sampled matmuls use a guarded one-level Strassen contraction \citep{strassen1969gaussian} when the matrix shape is large enough. This is still downstream of the mechanism above; the network-structure decisions determine which products are computed, and Strassen reduces the cost of sufficiently large dense products without changing the estimator's interpretation.

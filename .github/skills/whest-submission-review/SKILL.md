@@ -19,6 +19,11 @@ Use this skill before packaging or submitting a WHest estimator, or when investi
 5. Confirm reproducibility rules: no laptop-only paths, no network calls, no time-based seeds, dependencies declared.
 6. Package the correct target: single file for [estimator.py](../../../estimator.py), folder for helper modules, weights, or `requirements.txt`.
 7. Inspect the tarball before submit when the packaging surface is non-trivial.
+8. Submit an artifact at most once. If a submission id has already been created,
+   do not run `whest submit <artifact> --watch` or any other `whest submit`
+   command for that same artifact to check status; it creates a duplicate
+   submission. Use the AIcrowd submission URL or ask the user for grading status
+   instead unless a true status-only command is known.
 
 ## Must-Catch Submission Mistakes
 
@@ -27,6 +32,8 @@ Use this skill before packaging or submitting a WHest estimator, or when investi
 - Local-only globals, RNG state, or custom seeds that differ across subprocesses.
 - Shipping only `estimator.py` when helper modules or weights are required.
 - Over-budget or timed-out MLPs hidden inside a mean score.
+- Accidentally creating duplicate submissions by re-running `whest submit` on an
+	artifact that already returned a submission id.
 
 ## Source Docs
 

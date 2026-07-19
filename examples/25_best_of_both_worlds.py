@@ -1,4 +1,17 @@
-"""Algorithm 25: complex packing with 315856 packed-path cleanup.
+"""Algorithm 25 diagnostic fork: untracked NumPy dense execution.
+
+This version keeps the Algorithm 25 active-set classification policy, but uses
+a fixed diagnostic sample count instead of dynamic per-MLP allocation and moves
+numerical work out of flopscope into plain NumPy/SciPy. It disables the
+flopscope-accounting-oriented complex packing, Strassen, and packed row-sparse
+dispatch paths; dense BLAS is faster and easier to reason about when score
+accounting is not the goal.
+
+Use this for local diagnostics and sample-policy experiments. It is not the
+submission-safe flopscope-cost surface described below.
+
+Original Algorithm 25 header follows.
+Algorithm 25: complex packing with 315856 packed-path cleanup.
 
 Builds on Algorithm 24 / submission 315998 by keeping row-axis complex64
 sample packing and the Algorithm 21 per-layer block-split thresholds, then
@@ -9,6 +22,8 @@ antithetic reconstruction. The 315856 24,576-row packed chunks were rejected
 locally for wall-time safety on top of complex packing. Early high-`k` packed
 groups fall back to the existing complex/Strassen dense path once `k > width/2`.
 Submission 316005 transferred this row-dense fallback surface publicly.
+This version refits the column fire threshold to global `0.5`, matching the
+post-complex-packing cost model where dense paths are effectively half-priced.
 
 Original Algorithm 21 header follows.
 Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
@@ -52,19 +67,43 @@ rejected private antithetic pair-complement optimization.
 
 from __future__ import annotations
 
-import math
+import os
 from pathlib import Path
 
-import flopscope as flops
-import flopscope.numpy as fnp
+import numpy as fnp
+from scipy import special
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
-_BASE_SAMPLES = 30720
-_ANCHOR_SAMPLES = 49152
-_MAX_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
-_EASY_SAMPLES = 30720
-_VAR_REF = 0.02143
+def _read_sample_divisor() -> int:
+    try:
+        return max(1, int(os.environ.get("WHEST_DIAG_SAMPLE_DIVISOR", "1")))
+    except ValueError:
+        return 1
+
+
+def _read_requested_samples() -> int:
+    try:
+        samples = int(os.environ.get("WHEST_DIAG_SAMPLES", "30720"))
+    except ValueError:
+        samples = 30720
+    return max(2, min(61440, samples))
+
+
+def _read_antithetic_mode() -> bool:
+    return os.environ.get("WHEST_DIAG_ANTITHETIC", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _scaled_samples(samples: int) -> int:
+    scaled = samples / _DIAGNOSTIC_SAMPLE_DIVISOR
+    return max(2, int(round(scaled / 2.0) * 2))
+
+
+_DIAGNOSTIC_SAMPLE_DIVISOR = _read_sample_divisor()
+_ANTITHETIC_SAMPLES = _read_antithetic_mode()
+_REQUESTED_SAMPLES = _read_requested_samples()
+_TARGET_SAMPLES = _scaled_samples(_REQUESTED_SAMPLES)
+_BASE_SAMPLES = min(_scaled_samples(30720), _TARGET_SAMPLES)
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.05
@@ -81,48 +120,30 @@ _DEMOTE_ACTIVE_DEAD_STOP_LAYER = 29
 _ACTIVE_DEAD_PROBE_MAX = -2.5
 _ACTIVE_DEAD_THRESH = -3.0
 _MATERIALIZE_INTERMEDIATE_ROWS = False
-_PACKED_ROWSPARSE = True
-_PACKED_ROWSPARSE_START_LAYER = 1
-_PACKED_ROWSPARSE_STOP_LAYER = 29
-_PACKED_ROWSPARSE_CHUNK_ROWS = 16384
-_PACKED_ROWSPARSE_BUCKET = 16
-_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
-_PACKED_ROWSPARSE_MAX_K_NUM = 1
-_PACKED_ROWSPARSE_MAX_K_DEN = 2
-_PACKED_ROWSPARSE_EXTRA_BLOCKS = True
-_BLOCK_SPLIT_ROWSPARSE = True
-_BLOCK_SPLIT_FIRE_THRESH = 0.75
-# Per-layer overrides fitted on the nets 0-3 fire-rate census (fire_oracle),
-# holdout-validated on nets 4-12; layers absent here fall back to the default.
-_BLOCK_SPLIT_FIRE_THRESH_BY_LAYER = {
-    2: 0.825, 3: 0.925, 4: 0.95, 5: 0.8, 6: 0.825, 7: 0.825, 8: 0.85,
-    9: 0.875, 10: 0.9, 11: 0.875, 12: 0.9, 13: 0.875, 14: 0.925,
-    15: 0.85, 16: 0.8, 17: 0.9, 18: 0.8, 19: 0.875, 20: 0.925,
-    21: 0.925, 22: 0.925, 23: 0.95, 24: 0.925, 25: 0.9, 26: 0.925,
-    27: 0.95, 28: 0.75, 29: 0.7, 30: 0.8, 31: 1.0,
-}
-_BLOCK_SPLIT_MIN_DENSE_COLS = 32
-_BLOCK_SPLIT_MIN_SPARSE_COLS = 16
-_DENSE_STRASSEN = True
-_DENSE_STRASSEN_MIN_ROWS = 4096
-_DENSE_STRASSEN_MIN_IN = 64
-_DENSE_STRASSEN_MIN_OUT = 64
-# Row-axis complex64 sample packing: rows i and i+n/2 ride the real/imag lanes
-# of one half-shape matmul. Real weights never mix the lanes, so results are
-# exact; the remainder row (odd counts) stays on the real path.
-_COMPLEX_PACK = True
-_COMPLEX_PACK_MIN_ROWS = 256
 
 
 def _scatter(values, idx, width):
     """Functionally place values at idx into a zero vector of length width."""
-    return fnp.eye(width, dtype=fnp.float32)[:, idx] @ values
+    out = fnp.zeros(width, dtype=fnp.float32)
+    out[idx] = values
+    return out
 
 
-def _choose_samples(final_var_mean: float) -> int:
-    scaled = _ANCHOR_SAMPLES * math.sqrt(max(final_var_mean, 1e-30) / _VAR_REF)
-    samples = int(round(scaled / 2.0) * 2)
-    return max(_EASY_SAMPLES, min(_MAX_SAMPLES, samples))
+def _sobol_path(base_dir: Path) -> Path:
+    candidates = [base_dir / "sobol_points.npz", base_dir.parent / "sobol_points.npz"]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+def _fast_mlp(mlp: MLP) -> MLP:
+    return MLP(
+        width=mlp.width,
+        depth=mlp.depth,
+        weights=[fnp.asarray(w, dtype=fnp.float32) for w in mlp.weights],
+        seed=mlp.seed,
+    )
 
 
 def _probe_rows(n_samples: int, fraction: float) -> int:
@@ -162,196 +183,12 @@ def _staged_threshold_split(source_idx, x, weights, n_samples: int, threshold: f
     return fnp.sort(above_idx), fnp.sort(below_idx)
 
 
-def _ceil_bucket(value: int, bucket: int, limit: int) -> int:
-    bucketed = ((value + bucket - 1) // bucket) * bucket
-    return min(limit, max(0, bucketed))
+def _matmul(x, weights):
+    return x @ weights
 
 
-def _strassen_even_matmul(x, weights):
-    half_rows = x.shape[0] // 2
-    half_in = weights.shape[0] // 2
-    half_out = weights.shape[1] // 2
-
-    x11 = x[:half_rows, :half_in]
-    x12 = x[:half_rows, half_in:]
-    x21 = x[half_rows:, :half_in]
-    x22 = x[half_rows:, half_in:]
-
-    w11 = weights[:half_in, :half_out]
-    w12 = weights[:half_in, half_out:]
-    w21 = weights[half_in:, :half_out]
-    w22 = weights[half_in:, half_out:]
-
-    prod = (x11 + x22) @ (w11 + w22)
-    out11 = prod
-    out22 = prod
-
-    prod = (x21 + x22) @ w11
-    out21 = prod
-    out22 = out22 - prod
-
-    prod = x11 @ (w12 - w22)
-    out12 = prod
-    out22 = out22 + prod
-
-    prod = x22 @ (w21 - w11)
-    out11 = out11 + prod
-    out21 = out21 + prod
-
-    prod = (x11 + x12) @ w22
-    out11 = out11 - prod
-    out12 = out12 + prod
-
-    prod = (x21 - x11) @ (w11 + w12)
-    out22 = out22 + prod
-
-    prod = (x12 - x22) @ (w21 + w22)
-    out11 = out11 + prod
-
-    top = fnp.concatenate([out11, out12], axis=1)
-    bottom = fnp.concatenate([out21, out22], axis=1)
-    return fnp.concatenate([top, bottom], axis=0)
-
-
-def _dense_matmul(x, weights):
-    if _COMPLEX_PACK and x.shape[0] >= _COMPLEX_PACK_MIN_ROWS:
-        half = x.shape[0] // 2
-        xc = x[:half, :].astype(fnp.complex64) + x[half : 2 * half, :].astype(fnp.complex64) * fnp.complex64(1j)
-        pc = _dense_matmul_core(xc, weights.astype(fnp.complex64))
-        parts = [fnp.real(pc), fnp.imag(pc)]
-        if 2 * half < x.shape[0]:
-            parts.append(_dense_matmul_core(x[2 * half :, :], weights))
-        return fnp.concatenate(parts, axis=0)
-    return _dense_matmul_core(x, weights)
-
-
-def _dense_matmul_core(x, weights):
-    row_count = x.shape[0]
-    in_width = weights.shape[0]
-    out_width = weights.shape[1]
-    if (
-        not _DENSE_STRASSEN
-        or row_count < _DENSE_STRASSEN_MIN_ROWS
-        or in_width < _DENSE_STRASSEN_MIN_IN
-        or out_width < _DENSE_STRASSEN_MIN_OUT
-    ):
-        return x @ weights
-
-    core_rows = row_count - (row_count % 2)
-    core_in = in_width - (in_width % 2)
-    core_out = out_width - (out_width % 2)
-    if core_rows < _DENSE_STRASSEN_MIN_ROWS or core_in < _DENSE_STRASSEN_MIN_IN or core_out < _DENSE_STRASSEN_MIN_OUT:
-        return x @ weights
-
-    result_core = _strassen_even_matmul(x[:core_rows, :core_in], weights[:core_in, :core_out])
-    if core_in < in_width:
-        result_core = result_core + (x[:core_rows, core_in:] @ weights[core_in:, :core_out])
-
-    if core_out < out_width:
-        right_cols = x[:core_rows, :] @ weights[:, core_out:]
-        result = fnp.concatenate([result_core, right_cols], axis=1)
-    else:
-        result = result_core
-
-    if core_rows < row_count:
-        bottom_rows = x[core_rows:, :] @ weights
-        return fnp.concatenate([result, bottom_rows], axis=0)
-    return result
-
-
-def _packed_matmul(x, weights, positive_mask=None):
-    n_rows = x.shape[0]
-    prev_width = weights.shape[0]
-    out_width = weights.shape[1]
-    chunks = []
-
-    for start in range(0, n_rows, _PACKED_ROWSPARSE_CHUNK_ROWS):
-        stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
-        x_chunk = x[start:stop, :]
-        chunk_rows = stop - start
-        mask_chunk = positive_mask[start:stop, :] if positive_mask is not None else x_chunk > fnp.float32(0.0)
-
-        nnz_per_row = fnp.sum(mask_chunk, axis=1)
-        max_nnz = int(fnp.max(nnz_per_row))
-        if max_nnz == 0:
-            chunks.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
-            continue
-
-        row_order = fnp.argsort(nnz_per_row)
-        x_sorted = fnp.take(x_chunk, row_order, axis=0)
-        mask_sorted = fnp.take(mask_chunk, row_order, axis=0)
-        sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
-        sorted_chunks = []
-        group_start = 0
-        for limit in _PACKED_ROWSPARSE_ROW_BUCKETS:
-            if limit > prev_width:
-                continue
-            group_stop = int(fnp.searchsorted(sorted_nnz, limit, side="right"))
-            if group_stop <= group_start:
-                continue
-
-            x_group = x_sorted[group_start:group_stop, :]
-            group_rows = group_stop - group_start
-            if limit == 0:
-                sorted_chunks.append(fnp.zeros((group_rows, out_width), dtype=fnp.float32))
-            else:
-                k = _ceil_bucket(limit, _PACKED_ROWSPARSE_BUCKET, prev_width)
-                if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
-                    sorted_chunks.append(_dense_matmul(x_group, weights))
-                else:
-                    mask_group = mask_sorted[group_start:group_stop, :]
-                    order = fnp.argpartition(mask_group, prev_width - k, axis=1)[:, -k:]
-                    values = fnp.take_along_axis(x_group, order, axis=1)
-                    gathered_weights = fnp.take(weights, order, axis=0)
-                    sorted_chunks.append(fnp.einsum("nk,nko->no", values, gathered_weights))
-
-            group_start = group_stop
-            if group_start == chunk_rows:
-                break
-
-        if group_start < chunk_rows:
-            sorted_chunks.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
-
-        pre_sorted = sorted_chunks[0] if len(sorted_chunks) == 1 else fnp.concatenate(sorted_chunks, axis=0)
-        pre_chunk = fnp.empty_like(pre_sorted)
-        fnp.put_along_axis(pre_chunk, row_order[:, None], pre_sorted, axis=0)
-        chunks.append(pre_chunk)
-
-    if len(chunks) == 1:
-        return chunks[0]
-    return fnp.concatenate(chunks, axis=0)
-
-
-def _packed_relu_matmul(x, weights):
-    return fnp.maximum(_packed_matmul(x, weights), 0.0)
-
-
-def _split_matmul_with_fire(x, weights, fire_rate, threshold: float, positive_mask=None):
-    dense_pos = fnp.nonzero(fire_rate >= fnp.float32(threshold))[0]
-    sparse_pos = fnp.nonzero(fire_rate < fnp.float32(threshold))[0]
-
-    if len(dense_pos) < _BLOCK_SPLIT_MIN_DENSE_COLS or len(sparse_pos) < _BLOCK_SPLIT_MIN_SPARSE_COLS:
-        return _packed_matmul(x, weights, positive_mask)
-
-    x_dense = fnp.take(x, dense_pos, axis=1)
-    w_dense = fnp.take(weights, dense_pos, axis=0)
-    x_sparse = fnp.take(x, sparse_pos, axis=1)
-    w_sparse = fnp.take(weights, sparse_pos, axis=0)
-    sparse_mask = None if positive_mask is None else fnp.take(positive_mask, sparse_pos, axis=1)
-    return _dense_matmul(x_dense, w_dense) + _packed_matmul(x_sparse, w_sparse, sparse_mask)
-
-
-def _block_split_matmul(x, weights, layer_idx: int):
-    positive_mask = x > fnp.float32(0.0)
-    if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
-        return _packed_matmul(x, weights, positive_mask)
-    fire_rate = fnp.mean(positive_mask, axis=0)
-    threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
-    return _split_matmul_with_fire(x, weights, fire_rate, threshold, positive_mask)
-
-
-def _block_split_relu_matmul(x, weights, layer_idx: int):
-    return fnp.maximum(_block_split_matmul(x, weights, layer_idx), 0.0)
+def _relu_matmul(x, weights):
+    return fnp.maximum(_matmul(x, weights), 0.0)
 
 
 class Estimator(BaseEstimator):
@@ -362,13 +199,14 @@ class Estimator(BaseEstimator):
 
     def setup(self, ctx: SetupContext) -> None:
         fnp.random.default_rng(ctx.seed)
-        sobol_path = Path(ctx.submission_dir) / "sobol_points.npz"
+        base_dir = Path(ctx.submission_dir) if ctx.submission_dir is not None else Path(__file__).resolve().parent
+        sobol_path = _sobol_path(base_dir)
         data = fnp.load(str(sobol_path))
         self._sobol_points = data["points"]
 
     def _load_sobol_points(self) -> None:
         if self._sobol_points is None:
-            data = fnp.load(str(Path(__file__).resolve().parent / "sobol_points.npz"))
+            data = fnp.load(str(_sobol_path(Path(__file__).resolve().parent)))
             self._sobol_points = data["points"]
 
     def _initial_structure(self, mlp: MLP, width: int) -> dict:
@@ -379,12 +217,12 @@ class Estimator(BaseEstimator):
         dead_corrections = []
         analytical_rows = []
         alpha_rows = []
-        mu_post = fnp.zeros(width)
-        var_post = fnp.zeros(width)
+        mu_post = fnp.zeros(width, dtype=fnp.float32)
+        var_post = fnp.zeros(width, dtype=fnp.float32)
 
         for layer_idx, w in enumerate(mlp.weights):
             if layer_idx == 0:
-                mu_pre = fnp.zeros(width)
+                mu_pre = fnp.zeros(width, dtype=fnp.float32)
                 var_pre = fnp.sum(w * w, axis=0)
             else:
                 mu_pre = w.T @ mu_post
@@ -405,8 +243,8 @@ class Estimator(BaseEstimator):
             kink_indices.append(fnp.nonzero(kink_mask)[0])
             on_indices.append(fnp.nonzero(on_mask)[0])
 
-            phi = flops.stats.norm.pdf(alpha)
-            Phi = flops.stats.norm.cdf(alpha)
+            phi = fnp.exp(fnp.float32(-0.5) * alpha * alpha) * fnp.float32(0.3989422804014327)
+            Phi = special.ndtr(alpha).astype(fnp.float32, copy=False)
             mu_post = mu_pre * Phi + sigma_pre * phi
             var_post = (var_pre + mu_pre * mu_pre) * Phi + mu_pre * sigma_pre * phi - mu_post * mu_post
             var_post = fnp.maximum(var_post, 1e-12)
@@ -415,7 +253,7 @@ class Estimator(BaseEstimator):
             if len(dead_idx) > 0 and (_MATERIALIZE_INTERMEDIATE_ROWS or layer_idx == mlp.depth - 1):
                 dead_corrections.append(_scatter(mu_post[dead_idx], dead_idx, width))
             else:
-                dead_corrections.append(fnp.zeros(width))
+                dead_corrections.append(fnp.zeros(width, dtype=fnp.float32))
 
         return {
             "active_indices": active_indices,
@@ -428,15 +266,15 @@ class Estimator(BaseEstimator):
             "final_var_mean": float(fnp.mean(var_post)),
         }
 
-    def _sample_block(self, start_half: int, half_count: int, width: int):
+    def _sample_block(self, start_row: int, row_count: int, width: int):
         self._load_sobol_points()
-        end_half = start_half + half_count
-        if self._sobol_points.shape[0] < end_half:
+        end_row = start_row + row_count
+        if self._sobol_points.shape[0] < end_row:
             raise ValueError(
-                f"sobol_points.npz has {self._sobol_points.shape[0]} half-samples, "
-                f"but this estimator needs {end_half}."
+                f"sobol_points.npz has {self._sobol_points.shape[0]} rows, "
+                f"but this estimator needs {end_row}."
             )
-        return fnp.array(self._sobol_points[start_half:end_half, :width])
+        return fnp.asarray(self._sobol_points[start_row:end_row, :width], dtype=fnp.float32)
 
     def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
         width = mlp.width
@@ -458,8 +296,8 @@ class Estimator(BaseEstimator):
             on_idx = on_indices[layer_idx]
 
             if len(idx) == 0:
-                mc_rows.append(fnp.zeros(width))
-                x = fnp.zeros((n_samples, 0))
+                mc_rows.append(fnp.zeros(width, dtype=fnp.float32))
+                x = fnp.zeros((n_samples, 0), dtype=fnp.float32)
                 prev_idx = idx
                 x_before_fold = None
                 continue
@@ -539,7 +377,7 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                x_kink = _block_split_relu_matmul(x, w_kink, layer_idx)
+                x_kink = _relu_matmul(x, w_kink)
                 kink_mean = fnp.mean(x_kink, axis=0)
 
                 mean_prev = fnp.mean(x, axis=0)
@@ -557,13 +395,13 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                pre_from_kink = _block_split_matmul(x, w_from_kink, layer_idx)
+                pre_from_kink = _matmul(x, w_from_kink)
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
                 w_this_from_on = w[fold_on_idx, :][:, kink_idx]
                 w_folded = w_fold_on @ w_this_from_on
-                pre_from_on = _dense_matmul(x_before_fold, w_folded)
+                pre_from_on = _matmul(x_before_fold, w_folded)
 
                 x_kink = fnp.maximum(pre_from_kink + pre_from_on, 0.0)
                 kink_mean = fnp.mean(x_kink, axis=0)
@@ -611,26 +449,19 @@ class Estimator(BaseEstimator):
 
             if prev_idx is None:
                 w_active = w[:, idx]
-                half_rows = n_samples // 2
-                pre_half = _dense_matmul(x[:half_rows, :], w_active)
-                x = fnp.concatenate([fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0)], axis=0)
+                if _ANTITHETIC_SAMPLES:
+                    half_rows = n_samples // 2
+                    pre_half = _matmul(x[:half_rows, :], w_active)
+                    x = fnp.concatenate([fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0)], axis=0)
+                else:
+                    x = _relu_matmul(x[:n_samples, :], w_active)
             else:
                 w_active = w[prev_idx, :][:, idx]
-                if (
-                    _PACKED_ROWSPARSE
-                    and (refine or _PACKED_ROWSPARSE_EXTRA_BLOCKS)
-                    and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
-                ):
-                    if _BLOCK_SPLIT_ROWSPARSE:
-                        x = _block_split_relu_matmul(x, w_active, layer_idx)
-                    else:
-                        x = _packed_relu_matmul(x, w_active)
-                else:
-                    x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
+                x = _relu_matmul(x, w_active)
             if _MATERIALIZE_INTERMEDIATE_ROWS or layer_idx >= 30:
                 mc_rows.append(_scatter(fnp.mean(x, axis=0), idx, width))
             else:
-                mc_rows.append(fnp.zeros(width))
+                mc_rows.append(fnp.zeros(width, dtype=fnp.float32))
             prev_idx = idx
 
         if _MATERIALIZE_INTERMEDIATE_ROWS:
@@ -655,21 +486,24 @@ class Estimator(BaseEstimator):
         return rows, refined_structure
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
+        mlp = _fast_mlp(mlp)
         width = mlp.width
         structure = self._initial_structure(mlp, width)
-        target_samples = _choose_samples(structure["final_var_mean"])
-        base_x = self._sample_block(0, _BASE_SAMPLES // 2, width)
+        base_rows_needed = _BASE_SAMPLES // 2 if _ANTITHETIC_SAMPLES else _BASE_SAMPLES
+        base_x = self._sample_block(0, base_rows_needed, width)
         base_rows, refined_structure = self._run_block(
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
-        if target_samples <= _BASE_SAMPLES:
+        if _TARGET_SAMPLES <= _BASE_SAMPLES:
             return fnp.stack(base_rows, axis=0)
 
-        extra_samples = target_samples - _BASE_SAMPLES
-        extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
+        extra_samples = _TARGET_SAMPLES - _BASE_SAMPLES
+        extra_start = _BASE_SAMPLES // 2 if _ANTITHETIC_SAMPLES else _BASE_SAMPLES
+        extra_rows_needed = extra_samples // 2 if _ANTITHETIC_SAMPLES else extra_samples
+        extra_x = self._sample_block(extra_start, extra_rows_needed, width)
         extra_rows = self._run_block(mlp, refined_structure, extra_x, extra_samples, refine=False)[0]
         combined_rows = [
-            (base_row * _BASE_SAMPLES + extra_row * extra_samples) / target_samples
+            (base_row * _BASE_SAMPLES + extra_row * extra_samples) / _TARGET_SAMPLES
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
         return fnp.stack(combined_rows, axis=0)

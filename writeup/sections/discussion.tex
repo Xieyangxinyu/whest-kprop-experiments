@@ -1,0 +1,32 @@
+\section{Discussion}
+
+The estimator is not a pure cumulant-propagation or covariance-propagation method. It still uses a substantial antithetic quasi-Monte Carlo block for kink paths. Its mechanistic content is the way it chooses, structures, and propagates that block. The diagonal Gaussian pass provides an explanation of which neurons should be dead, linear, or uncertain; the staged probes test only the uncertain parts that matter; the row-sparse kernel exploits the exact ReLU masks created by those decisions.
+
+This perspective also changes how to read the implementation. The dense/sparse split and layer-30 fold are not merely engineering tricks; they are decisions forced by the observed behavior of the ReLU network. Once the estimator knows which neurons are linear, dead, high-fire, or genuinely sparse, the corresponding matmul shape is part of the mechanism. The structural observation is that a large fraction of the network can be treated as predictable linear or dead structure, leaving a smaller stochastic computation concentrated around activation boundaries.
+
+The main limitation is that the estimator does not yet eliminate sampling variance at the kink paths. Better mechanistic progress would replace more of the sampled active path with a controlled low-order distributional approximation, or identify which cross-neuron dependencies matter enough to track. Recent analytic covariance-propagation work gives one example of a more ambitious second-order direction \citep{wright2024analytic}. Failed sparse-support experiments point in a related direction: row supports overlap substantially, suggesting exploitable structure remains, but the current implementation does not yet expose it cheaply enough.
+
+A useful stress test is to ask whether the same hard regimes would arise under smooth activations. \Cref{fig:activation-function-regimes,fig:activation-function-design-matrices,fig:activation-function-covariance} repeats the diagnostic on matched random MLPs with ReLU, GELU \citep{hendrycks2016gelu}, and SiLU \citep{elfwing2018silu}, using the same ReLU-He weight scaling. The result is not activation-agnostic. ReLU creates literal always-off and always-on regions, which justify exact dead pruning and linear folds. GELU and SiLU have no hard zero or identity region, so the same visualization should be read as scale and curvature rather than dead/on classification. In particular, the SiLU panels shrink strongly toward near-zero activations under this ReLU-tuned initialization; this is an activation-scale collapse, not a dying-ReLU phenomenon. The broader lesson is still mechanistic: inspect the activation distribution and sample matrix first, then choose the computation that matches that network's behavior.
+
+\begin{figure}[p]
+	\centering
+	\includegraphics[width=\linewidth]{figures/activation_function_regime_comparison.png}
+	\caption{Matched random MLPs with ReLU, GELU, and SiLU under the same ReLU-He weight scaling. ReLU develops hard always-off, near-kink, and always-on populations. Smooth activations do not have literal dead/on regimes; the GELU and SiLU panels instead show how much of the network is in a smooth transition or near-zero-scale region under this initialization.}
+	\label{fig:activation-function-regimes}
+\end{figure}
+
+\begin{figure}[p]
+	\centering
+	\includegraphics[width=\linewidth]{figures/activation_function_design_matrix_comparison.png}
+	\caption{Sorted sample activation matrices for the same matched networks. Columns are ordered by firing rate and intensities show absolute activation magnitude. The ReLU row has a literal blank dead block, a transition block, and a dense high-fire block. The smooth activations retain transition-like columns; the SiLU final layer appears blank because the activation scale has collapsed under this ReLU-tuned initialization.}
+	\label{fig:activation-function-design-matrices}
+\end{figure}
+
+\begin{figure}[p]
+	\centering
+	\includegraphics[width=\linewidth]{figures/activation_function_covariance_comparison.png}
+	\caption{Activation covariance and rank-collapse comparison for the matched activation functions. The colorbar is shared across all panels and placed outside the heatmaps. ReLU keeps a hard firing-rate boundary with a concentrated late correlated core; GELU and SiLU also show rank collapse, but without the exact ReLU dead/on identities used by the submitted estimator.}
+	\label{fig:activation-function-covariance}
+\end{figure}
+
+For the purposes of the challenge, the result shows that white-box structure can substantially improve the compute-accuracy tradeoff over plain sampling. For the broader mechanistic-estimation agenda, the lesson is narrower but encouraging: even a simple Gaussian regime classifier can turn a random MLP into a smaller estimation problem whose remaining uncertainty is localized and measurable.

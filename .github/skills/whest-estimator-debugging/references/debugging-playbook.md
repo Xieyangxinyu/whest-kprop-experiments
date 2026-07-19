@@ -27,8 +27,8 @@ uv run python estimator.py --baseline mean_propagation
 - `PREDICT_ERROR`: rerun with `--debug --fail-fast` and fix the traceback line.
 - `SETUP_TIMEOUT`: move heavy setup to shipped artifacts, scratch cache, or predict-time logic.
 - `budget_exhausted`: analytical flopscope budget tripped before an operation ran.
-- `combined_budget_exhausted`: `effective_compute = flops_used + lambda * residual_wall_time_s` exceeded budget after Python overhead was counted.
-- `time_exhausted` or residual wall-time exhaustion: check Python loops, external libraries, print spam, and unbounded operations.
+- `combined_budget_exhausted`: `effective_compute = flops_used + lambda * residual_wall_time_s` exceeded budget after participant residual time was counted.
+- `time_exhausted` or residual wall-time exhaustion: in flopscope `0.8.x`, framework/client plumbing should be attributed outside participant residual time, so first check your Python loops, callbacks, external libraries, print spam, and unbounded operations.
 
 ## Report Fields to Inspect
 
@@ -45,6 +45,7 @@ Inspect:
 - `all_layers_mse`
 - `mean_score_multiplier`
 - per-MLP `flops_used`, `effective_compute`, `residual_wall_time_s`
+- per-operation breakdown / `budget.summary()` when available, especially after flopscope or whestbench upgrades
 - per-MLP `budget_exhausted`, `combined_budget_exhausted`, `time_exhausted`
 - per-MLP `error`, `error_code`, `traceback`
 

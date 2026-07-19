@@ -1,43 +1,4 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
-
-Identical to Algorithm 31 (submission 317197) except classification pilot
-probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
-first 512 / 2,048 rows of x[0] AND the matching rows of x[1] (the same
-Sobol points with opposite sign), concatenated -- pair-balanced, so
-odd-order error terms in the alpha mean cancel. Probe row counts, sample
-reuse, artifact (original 30,720-half realization), N = 61,440, packing,
-and routing are all unchanged; only near-threshold classification
-decisions can differ. Local paired evidence (seed 42, 10 MLPs,
-bench_logs/submission_learnings_2026-07-19.md): raw +0.06% (wash, mixed
-per-MLP +/-0.7%), flops +0.32%, local adjusted -2.4% carried entirely by
-the residual-wall term (contention-contaminated). Deliberate grader
-instrument for the residual-vs-FLOP machine-speed flip (315844/315892
-lesson); expected grader outcome: tie to +0.3%.
-
-Original Algorithm 31 header follows.
-Algorithm 31: fixed full-artifact sampling (N = 61,440 for every net).
-
-Replaces the analytical-variance sample rule (``N_i = clip(49152 *
-sqrt(V_i / V_ref), 30720, 61440)``) with a constant N: a 10,240-sample
-base block (refined classification) plus one 51,200-sample continuation
-block, merged sample-count-weighted. This reproduces bit-exactly the
-execution path that submission 317172 graded (adjusted 1.3109e-7, raw
-2.9772e-7, multiplier 0.44127) when Algorithm 30's flop metering failed
-remotely and fell back to the full artifact.
-
-Why fixed N: per-net FLOP budgets are separable (no shared budget), so
-the sqrt-variance allocation optimized a nonexistent objective; the
-separable per-net optimum is ~constant N, the adjusted(N) bowl is ~4%
-deep across 14k-61k, and only the full-length Sobol prefix realization
-is leaderboard-validated (same-day pair 317172 vs 317185: -3.9%).
-See bench_logs/submission_learnings_2026-07-18.md. Sampling surface,
-classification, packing, and Strassen routing are unchanged from
-Algorithm 21 / submission 316405. (Unrelated to the retired
-"Algorithm 31" unpack idea noted 2026-07-17 - that number was never
-assigned.)
-
-Original Algorithm 21 header follows.
-Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
+"""Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
 
 Builds on Algorithm 17 / submission 315824. The single _BLOCK_SPLIT_FIRE_THRESH
 (0.75) is replaced by a per-layer map fitted from a 4-net fire-rate census
@@ -78,6 +39,7 @@ rejected private antithetic pair-complement optimization.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import flopscope as flops
@@ -85,8 +47,11 @@ import flopscope.numpy as fnp
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
-_BASE_SAMPLES = 10240
-_TOTAL_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
+_BASE_SAMPLES = 30720
+_ANCHOR_SAMPLES = 49152
+_MAX_SAMPLES = 49152  # wave-pacing insurance cap (artifact supports 61440)
+_EASY_SAMPLES = 30720
+_VAR_REF = 0.02143
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.05
@@ -108,9 +73,9 @@ _PACKED_ROWSPARSE_START_LAYER = 1
 _PACKED_ROWSPARSE_STOP_LAYER = 29
 _PACKED_ROWSPARSE_CHUNK_ROWS = 16384
 _PACKED_ROWSPARSE_BUCKET = 16
-_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
+_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
 _PACKED_ROWSPARSE_MAX_K_NUM = 3
-_PACKED_ROWSPARSE_MAX_K_DEN = 4
+_PACKED_ROWSPARSE_MAX_K_DEN = 4  # (b): set 1/2 for row-dense fallback
 _PACKED_ROWSPARSE_EXTRA_BLOCKS = True
 _BLOCK_SPLIT_ROWSPARSE = True
 _BLOCK_SPLIT_FIRE_THRESH = 0.75
@@ -136,12 +101,18 @@ def _scatter(values, idx, width):
     return fnp.eye(width, dtype=fnp.float32)[:, idx] @ values
 
 
+def _choose_samples(final_var_mean: float) -> int:
+    scaled = _ANCHOR_SAMPLES * math.sqrt(max(final_var_mean, 1e-30) / _VAR_REF)
+    samples = int(round(scaled / 2.0) * 2)
+    return max(_EASY_SAMPLES, min(_MAX_SAMPLES, samples))
+
+
 def _probe_rows(n_samples: int, fraction: float) -> int:
     return max(2, min(n_samples, int(n_samples * fraction)))
 
 
-def _sample_alpha(x2, weights, rows: int):
-    pre = fnp.concatenate([x2[0][:rows, :] @ weights, x2[1][:rows, :] @ weights], axis=0)
+def _sample_alpha(x, weights, rows: int):
+    pre = x[:rows, :] @ weights
     mean = fnp.mean(pre, axis=0)
     var = fnp.var(pre, axis=0)
     return mean / fnp.sqrt(fnp.maximum(var, 1e-12))
@@ -194,17 +165,20 @@ def _strassen_even_matmul(x, weights):
     w22 = weights[half_in:, half_out:]
 
     prod1 = (x11 + x22) @ (w11 + w22)
-    prod2 = (x21 + x22) @ w11
-    prod3 = x11 @ (w12 - w22)
     prod4 = x22 @ (w21 - w11)
+    out11 = prod1 + prod4
     prod5 = (x11 + x12) @ w22
-    prod6 = (x21 - x11) @ (w11 + w12)
+    out11 = out11 - prod5
     prod7 = (x12 - x22) @ (w21 + w22)
-
-    out11 = prod1 + prod4 - prod5 + prod7
+    out11 = out11 + prod7
+    prod3 = x11 @ (w12 - w22)
     out12 = prod3 + prod5
+    prod2 = (x21 + x22) @ w11
     out21 = prod2 + prod4
-    out22 = prod1 - prod2 + prod3 + prod6
+    out22 = prod1 - prod2
+    out22 = out22 + prod3
+    prod6 = (x21 - x11) @ (w11 + w12)
+    out22 = out22 + prod6
 
     top = fnp.concatenate([out11, out12], axis=1)
     bottom = fnp.concatenate([out21, out22], axis=1)
@@ -255,17 +229,20 @@ def _dense_matmul_2blk(x2, weights):
     w22 = weights[half_in:core_in, half_out:core_out]
 
     prod1 = (x11 + x22) @ (w11 + w22)
-    prod2 = (x21 + x22) @ w11
-    prod3 = x11 @ (w12 - w22)
     prod4 = x22 @ (w21 - w11)
+    out11 = prod1 + prod4
     prod5 = (x11 + x12) @ w22
-    prod6 = (x21 - x11) @ (w11 + w12)
+    out11 = out11 - prod5
     prod7 = (x12 - x22) @ (w21 + w22)
-
-    out11 = prod1 + prod4 - prod5 + prod7
+    out11 = out11 + prod7
+    prod3 = x11 @ (w12 - w22)
     out12 = prod3 + prod5
+    prod2 = (x21 + x22) @ w11
     out21 = prod2 + prod4
-    out22 = prod1 - prod2 + prod3 + prod6
+    out22 = prod1 - prod2
+    out22 = out22 + prod3
+    prod6 = (x21 - x11) @ (w11 + w12)
+    out22 = out22 + prod6
 
     top = fnp.concatenate([out11, out12], axis=1)
     bottom = fnp.concatenate([out21, out22], axis=1)
@@ -335,23 +312,29 @@ def _packed_matmul(x, weights, positive_mask=None):
         mask_chunk = positive_mask[start:stop, :] if positive_mask is not None else x_chunk > fnp.float32(0.0)
 
         nnz_per_row = fnp.sum(mask_chunk, axis=1)
-        max_nnz = int(fnp.max(nnz_per_row))
-        if max_nnz == 0:
-            all_groups.append(fnp.zeros((chunk_rows, out_width), dtype=fnp.float32))
-            # all-zero rows are interchangeable: any permutation restores them
-            chunk_orders.append(fnp.argsort(nnz_per_row) + start)
-            continue
-
+        # No int(fnp.max) early-exit: it cost one host sync per chunk purely
+        # to short-circuit all-zero chunks, which the limit-0 group already
+        # handles exactly (all rows land in the zeros group below).
         row_order = fnp.argsort(nnz_per_row)
         x_sorted = fnp.take(x_chunk, row_order, axis=0)
         mask_sorted = fnp.take(mask_chunk, row_order, axis=0)
         sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
+        # ONE vectorized searchsorted + ONE host pull for every group boundary
+        # (was one int() sync per bucket per chunk, ~1,400/net). Same
+        # boundaries, same groups, bit-identical outputs. algo20 measured this
+        # class as locally null - locally searchsorted is a CPU call; on the
+        # grader each int() is a RemoteArray round trip (316005 op pricing).
+        valid_limits = [l for l in _PACKED_ROWSPARSE_ROW_BUCKETS if l <= prev_width]
+        bounds = fnp.searchsorted(sorted_nnz, fnp.array(valid_limits), side="right")
+        try:
+            # standard ndarray API: one host round trip for all boundaries
+            bounds_host = bounds.tolist()
+        except (AttributeError, TypeError):
+            # conservative fallback: per-element pulls (the old sync count)
+            bounds_host = [int(bounds[i]) for i in range(len(valid_limits))]
         sorted_chunks = all_groups  # group outputs accumulate globally
         group_start = 0
-        for limit in _PACKED_ROWSPARSE_ROW_BUCKETS:
-            if limit > prev_width:
-                continue
-            group_stop = int(fnp.searchsorted(sorted_nnz, limit, side="right"))
+        for limit, group_stop in zip(valid_limits, (int(b) for b in bounds_host)):
             if group_stop <= group_start:
                 continue
 
@@ -511,8 +494,10 @@ class Estimator(BaseEstimator):
                 f"sobol_points.npz has {self._sobol_points.shape[0]} half-samples, "
                 f"but this estimator needs {end_half}."
             )
+        # layer 0 reconstructs the antithetic pair from pre_half exactly;
+        # the -half input block is never read, so do not materialize it
         half = fnp.array(self._sobol_points[start_half:end_half, :width])
-        return half, -half
+        return half, half
 
     def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
         width = mlp.width
@@ -551,7 +536,7 @@ class Estimator(BaseEstimator):
                 if len(probe_kink_idx) > 0:
                     w_kink_probe = w[prev_idx, :][:, probe_kink_idx]
                     kept_probe_kink_idx, demoted_kink_idx = _staged_threshold_split(
-                        probe_kink_idx, x, w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
+                        probe_kink_idx, x[0], w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
                     )
                 else:
                     kept_probe_kink_idx = kink_idx[:0]
@@ -578,7 +563,7 @@ class Estimator(BaseEstimator):
                     if len(probe_on_idx) > 0:
                         w_on_probe = w[prev_idx, :][:, probe_on_idx]
                         kept_probe_on_idx, demoted_idx = _staged_threshold_split(
-                            probe_on_idx, x, w_on_probe, n_samples, _PILOT_ON_THRESH
+                            probe_on_idx, x[0], w_on_probe, n_samples, _PILOT_ON_THRESH
                         )
                     else:
                         demoted_idx = on_idx[:0]
@@ -597,7 +582,7 @@ class Estimator(BaseEstimator):
                         if len(probe_dead_idx) > 0:
                             w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                             promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                                probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                                probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                             )
                         else:
                             promoted_idx = dead_idx[:0]
@@ -671,7 +656,7 @@ class Estimator(BaseEstimator):
                     if len(probe_dead_idx) > 0:
                         w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                         promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                            probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                            probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                         )
                     else:
                         promoted_idx = dead_idx[:0]
@@ -691,7 +676,7 @@ class Estimator(BaseEstimator):
             if prev_idx is None:
                 w_active = w[:, idx]
                 half_rows = n_samples // 2
-                pre_half = _dense_matmul(x[0][:half_rows, :], w_active)
+                pre_half = _dense_matmul(x[0][:half_rows, :], w_active)  # x[1] unused: (d)
                 x = (fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0))
             else:
                 w_active = w[prev_idx, :][:, idx]
@@ -740,18 +725,19 @@ class Estimator(BaseEstimator):
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width = mlp.width
         structure = self._initial_structure(mlp, width)
+        target_samples = _choose_samples(structure["final_var_mean"])
         base_x = self._sample_block(0, _BASE_SAMPLES // 2, width)
         base_rows, refined_structure = self._run_block(
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
-        extra_samples = _TOTAL_SAMPLES - _BASE_SAMPLES
+        if target_samples <= _BASE_SAMPLES:
+            return fnp.stack(base_rows, axis=0)
+
+        extra_samples = target_samples - _BASE_SAMPLES
         extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
-        extra_rows = self._run_block(
-            mlp, refined_structure, extra_x, extra_samples, refine=False
-        )[0]
+        extra_rows = self._run_block(mlp, refined_structure, extra_x, extra_samples, refine=False)[0]
         combined_rows = [
-            base_row * _BASE_SAMPLES + extra_row * extra_samples
+            (base_row * _BASE_SAMPLES + extra_row * extra_samples) / target_samples
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
-        combined_rows = [row / _TOTAL_SAMPLES for row in combined_rows]
         return fnp.stack(combined_rows, axis=0)

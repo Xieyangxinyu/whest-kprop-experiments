@@ -1,40 +1,17 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
-
-Identical to Algorithm 31 (submission 317197) except classification pilot
-probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
-first 512 / 2,048 rows of x[0] AND the matching rows of x[1] (the same
-Sobol points with opposite sign), concatenated -- pair-balanced, so
-odd-order error terms in the alpha mean cancel. Probe row counts, sample
-reuse, artifact (original 30,720-half realization), N = 61,440, packing,
-and routing are all unchanged; only near-threshold classification
-decisions can differ. Local paired evidence (seed 42, 10 MLPs,
-bench_logs/submission_learnings_2026-07-19.md): raw +0.06% (wash, mixed
-per-MLP +/-0.7%), flops +0.32%, local adjusted -2.4% carried entirely by
-the residual-wall term (contention-contaminated). Deliberate grader
-instrument for the residual-vs-FLOP machine-speed flip (315844/315892
-lesson); expected grader outcome: tie to +0.3%.
-
-Original Algorithm 31 header follows.
-Algorithm 31: fixed full-artifact sampling (N = 61,440 for every net).
+"""Algorithm 30: floor-mode flop-metered N on the Algorithm 21 surface.
 
 Replaces the analytical-variance sample rule (``N_i = clip(49152 *
-sqrt(V_i / V_ref), 30720, 61440)``) with a constant N: a 10,240-sample
-base block (refined classification) plus one 51,200-sample continuation
-block, merged sample-count-weighted. This reproduces bit-exactly the
-execution path that submission 317172 graded (adjusted 1.3109e-7, raw
-2.9772e-7, multiplier 0.44127) when Algorithm 30's flop metering failed
-remotely and fell back to the full artifact.
-
-Why fixed N: per-net FLOP budgets are separable (no shared budget), so
-the sqrt-variance allocation optimized a nonexistent objective; the
-separable per-net optimum is ~constant N, the adjusted(N) bowl is ~4%
-deep across 14k-61k, and only the full-length Sobol prefix realization
-is leaderboard-validated (same-day pair 317172 vs 317185: -3.9%).
-See bench_logs/submission_learnings_2026-07-18.md. Sampling surface,
-classification, packing, and Strassen routing are unchanged from
-Algorithm 21 / submission 316405. (Unrelated to the retired
-"Algorithm 31" unpack idea noted 2026-07-17 - that number was never
-assigned.)
+sqrt(V_i / V_ref), 30720, 61440)``) with a deterministic flop-metered
+fill toward the 0.1-multiplier clamp: run a 10,240-sample base block,
+read the flopscope counter delta, then add continuation blocks sized by
+the measured per-sample cost until metered flops reach 8.5% of the FLOP
+budget (~9.7% effective once the grader adds sample-proportional
+residual wall pricing). Because the meter reads the same counter the
+grader prices
+with, the rule self-calibrates: if grader-side pricing runs hotter than
+local, N shrinks proportionally and the submission stays under the 0.1
+clamp. Sampling surface, classification, packing, and Strassen routing
+are byte-identical to Algorithm 21 / submission 316405.
 
 Original Algorithm 21 header follows.
 Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
@@ -86,7 +63,22 @@ from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
 _BASE_SAMPLES = 10240
-_TOTAL_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
+_MAX_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
+_FLOOR_TARGET_FRACTION = 0.085  # FLOP-meter target as a budget fraction.
+# The grader's effective compute adds residual wall time priced at
+# lambda ~5.8e9 flops-eq/s; for this surface the residual is the concat
+# class (~2.2 FLOP-eq/B, ~1.2e10 eq at fleet N ~53k), i.e. ~14.2% on
+# top of metered flops and roughly proportional to samples. Targeting
+# 0.085 * budget in flops lands effective compute at ~0.097 * budget,
+# just under the 0.1 multiplier clamp with ~3% margin for pricing noise.
+_F0_EST = 2.0e7  # out-of-block overhead (_initial_structure), measured
+_MIN_FILL_SAMPLES = 128
+_MAX_FILL_BLOCKS = 4
+_FIRST_FILL_SAFETY = 0.97  # undershoot the first fill so the last block,
+# sized with the measured fill slope, tops up to the target from below
+_FILL_SLOPE_RATIO = 1.10  # fill halves sit below the Strassen
+# _DENSE_STRASSEN_MIN_ROWS guard, so they price ~10% above the
+# base-derived per-sample slope (measured 1.105-1.111 on nets 1/5)
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.05
@@ -136,12 +128,16 @@ def _scatter(values, idx, width):
     return fnp.eye(width, dtype=fnp.float32)[:, idx] @ values
 
 
+def _flops_used() -> int:
+    return int(flops.budget_summary_dict()["flops_used"])
+
+
 def _probe_rows(n_samples: int, fraction: float) -> int:
     return max(2, min(n_samples, int(n_samples * fraction)))
 
 
-def _sample_alpha(x2, weights, rows: int):
-    pre = fnp.concatenate([x2[0][:rows, :] @ weights, x2[1][:rows, :] @ weights], axis=0)
+def _sample_alpha(x, weights, rows: int):
+    pre = x[:rows, :] @ weights
     mean = fnp.mean(pre, axis=0)
     var = fnp.var(pre, axis=0)
     return mean / fnp.sqrt(fnp.maximum(var, 1e-12))
@@ -551,7 +547,7 @@ class Estimator(BaseEstimator):
                 if len(probe_kink_idx) > 0:
                     w_kink_probe = w[prev_idx, :][:, probe_kink_idx]
                     kept_probe_kink_idx, demoted_kink_idx = _staged_threshold_split(
-                        probe_kink_idx, x, w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
+                        probe_kink_idx, x[0], w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
                     )
                 else:
                     kept_probe_kink_idx = kink_idx[:0]
@@ -578,7 +574,7 @@ class Estimator(BaseEstimator):
                     if len(probe_on_idx) > 0:
                         w_on_probe = w[prev_idx, :][:, probe_on_idx]
                         kept_probe_on_idx, demoted_idx = _staged_threshold_split(
-                            probe_on_idx, x, w_on_probe, n_samples, _PILOT_ON_THRESH
+                            probe_on_idx, x[0], w_on_probe, n_samples, _PILOT_ON_THRESH
                         )
                     else:
                         demoted_idx = on_idx[:0]
@@ -597,7 +593,7 @@ class Estimator(BaseEstimator):
                         if len(probe_dead_idx) > 0:
                             w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                             promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                                probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                                probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                             )
                         else:
                             promoted_idx = dead_idx[:0]
@@ -671,7 +667,7 @@ class Estimator(BaseEstimator):
                     if len(probe_dead_idx) > 0:
                         w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                         promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                            probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                            probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                         )
                     else:
                         promoted_idx = dead_idx[:0]
@@ -739,19 +735,42 @@ class Estimator(BaseEstimator):
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
         width = mlp.width
+        used_at_entry = _flops_used()
+        target_flops = int(budget * _FLOOR_TARGET_FRACTION)
+
         structure = self._initial_structure(mlp, width)
         base_x = self._sample_block(0, _BASE_SAMPLES // 2, width)
         base_rows, refined_structure = self._run_block(
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
-        extra_samples = _TOTAL_SAMPLES - _BASE_SAMPLES
-        extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
-        extra_rows = self._run_block(
-            mlp, refined_structure, extra_x, extra_samples, refine=False
-        )[0]
-        combined_rows = [
-            base_row * _BASE_SAMPLES + extra_row * extra_samples
-            for base_row, extra_row in zip(base_rows, extra_rows)
-        ]
-        combined_rows = [row / _TOTAL_SAMPLES for row in combined_rows]
+
+        base_cost = _flops_used() - used_at_entry
+        slope = max((base_cost - _F0_EST) / _BASE_SAMPLES * _FILL_SLOPE_RATIO, 1.0)
+        total_samples = _BASE_SAMPLES
+        weighted_rows = [row * _BASE_SAMPLES for row in base_rows]
+        next_half = _BASE_SAMPLES // 2
+        artifact_halves = self._sobol_points.shape[0]
+
+        for block_idx in range(_MAX_FILL_BLOCKS):
+            headroom = target_flops - (_flops_used() - used_at_entry)
+            if block_idx == 0:
+                headroom = int(headroom * _FIRST_FILL_SAFETY)
+            fill = int(headroom / slope) // 2 * 2
+            fill = min(fill, _MAX_SAMPLES - total_samples,
+                       2 * (artifact_halves - next_half))
+            if fill < _MIN_FILL_SAMPLES:
+                break
+            fill_x = self._sample_block(next_half, fill // 2, width)
+            fill_start = _flops_used()
+            fill_rows = self._run_block(
+                mlp, refined_structure, fill_x, fill, refine=False
+            )[0]
+            slope = max((_flops_used() - fill_start) / fill, 1.0)
+            next_half += fill // 2
+            total_samples += fill
+            weighted_rows = [
+                acc + row * fill for acc, row in zip(weighted_rows, fill_rows)
+            ]
+
+        combined_rows = [acc / total_samples for acc in weighted_rows]
         return fnp.stack(combined_rows, axis=0)

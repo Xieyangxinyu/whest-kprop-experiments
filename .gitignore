@@ -35,3 +35,6 @@ Thumbs.db
 
 # Internal process docs (specs, plans, scratch) — not for participant repo.
 .aicrowd/
+
+# Local submission staging folders (artifacts preserved via examples/ + tarballs)
+submissions/

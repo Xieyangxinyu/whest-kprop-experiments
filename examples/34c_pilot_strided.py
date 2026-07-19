@@ -1,21 +1,7 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
-
-Identical to Algorithm 31 (submission 317197) except classification pilot
-probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
-first 512 / 2,048 rows of x[0] AND the matching rows of x[1] (the same
-Sobol points with opposite sign), concatenated -- pair-balanced, so
-odd-order error terms in the alpha mean cancel. Probe row counts, sample
-reuse, artifact (original 30,720-half realization), N = 61,440, packing,
-and routing are all unchanged; only near-threshold classification
-decisions can differ. Local paired evidence (seed 42, 10 MLPs,
-bench_logs/submission_learnings_2026-07-19.md): raw +0.06% (wash, mixed
-per-MLP +/-0.7%), flops +0.32%, local adjusted -2.4% carried entirely by
-the residual-wall term (contention-contaminated). Deliberate grader
-instrument for the residual-vs-FLOP machine-speed flip (315844/315892
-lesson); expected grader outcome: tie to +0.3%.
-
-Original Algorithm 31 header follows.
-Algorithm 31: fixed full-artifact sampling (N = 61,440 for every net).
+# DEAD VARIANT (P3-strided, 2026-07-19, never submitted): even-spread (every-10th-row) pilot rows at unchanged 512/2,048 counts.
+# Paired seed-42 10-MLP result vs Algorithm 31: raw +0.32% (outlier +5.2%) at equal flops - Sobol-prefix balance is load-bearing.
+# See bench_logs/submission_learnings_2026-07-19.md (pilot-probe sweep).
+"""Algorithm 31: fixed full-artifact sampling (N = 61,440 for every net).
 
 Replaces the analytical-variance sample rule (``N_i = clip(49152 *
 sqrt(V_i / V_ref), 30720, 61440)``) with a constant N: a 10,240-sample
@@ -140,8 +126,12 @@ def _probe_rows(n_samples: int, fraction: float) -> int:
     return max(2, min(n_samples, int(n_samples * fraction)))
 
 
-def _sample_alpha(x2, weights, rows: int):
-    pre = fnp.concatenate([x2[0][:rows, :] @ weights, x2[1][:rows, :] @ weights], axis=0)
+def _sample_alpha(x, weights, rows: int):
+    total = x.shape[0]
+    if rows < total:
+        idx = (fnp.arange(rows) * total) // rows
+        x = fnp.take(x, idx, axis=0)
+    pre = x[:rows, :] @ weights
     mean = fnp.mean(pre, axis=0)
     var = fnp.var(pre, axis=0)
     return mean / fnp.sqrt(fnp.maximum(var, 1e-12))
@@ -551,7 +541,7 @@ class Estimator(BaseEstimator):
                 if len(probe_kink_idx) > 0:
                     w_kink_probe = w[prev_idx, :][:, probe_kink_idx]
                     kept_probe_kink_idx, demoted_kink_idx = _staged_threshold_split(
-                        probe_kink_idx, x, w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
+                        probe_kink_idx, x[0], w_kink_probe, n_samples, _ACTIVE_DEAD_THRESH
                     )
                 else:
                     kept_probe_kink_idx = kink_idx[:0]
@@ -578,7 +568,7 @@ class Estimator(BaseEstimator):
                     if len(probe_on_idx) > 0:
                         w_on_probe = w[prev_idx, :][:, probe_on_idx]
                         kept_probe_on_idx, demoted_idx = _staged_threshold_split(
-                            probe_on_idx, x, w_on_probe, n_samples, _PILOT_ON_THRESH
+                            probe_on_idx, x[0], w_on_probe, n_samples, _PILOT_ON_THRESH
                         )
                     else:
                         demoted_idx = on_idx[:0]
@@ -597,7 +587,7 @@ class Estimator(BaseEstimator):
                         if len(probe_dead_idx) > 0:
                             w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                             promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                                probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                                probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                             )
                         else:
                             promoted_idx = dead_idx[:0]
@@ -671,7 +661,7 @@ class Estimator(BaseEstimator):
                     if len(probe_dead_idx) > 0:
                         w_dead_probe = w[prev_idx, :][:, probe_dead_idx]
                         promoted_idx, remaining_probe_dead_idx = _staged_threshold_split(
-                            probe_dead_idx, x, w_dead_probe, n_samples, _PILOT_DEAD_THRESH
+                            probe_dead_idx, x[0], w_dead_probe, n_samples, _PILOT_DEAD_THRESH
                         )
                     else:
                         promoted_idx = dead_idx[:0]

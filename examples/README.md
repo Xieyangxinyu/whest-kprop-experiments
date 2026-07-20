@@ -8,6 +8,9 @@ Read in order. Each file is a complete, runnable Stage 1 estimator.
 | [02_mean_propagation.py](02_mean_propagation.py) | easy | First-order analytical: propagate per-neuron mean and diagonal variance through ReLU layers |
 | [03_covariance_propagation.py](03_covariance_propagation.py) | medium | Track full covariance, not just diagonal variance — costlier but more accurate |
 | [04_shipped_weights.py](04_shipped_weights.py) | easy | Ship a precomputed `weights.npz` next to your estimator and load it via `submission_dir` in `setup()` |
+| [05_cumulant_propagation.py](05_cumulant_propagation.py) | advanced | Cumulant-propagation-inspired ReLU moments with full covariance plus marginal third/fourth cumulants |
+| [06_full_k3_pruned.py](06_full_k3_pruned.py) | advanced | Factorized SIMPLE K3 propagation with repeated slices, fourth-order radial state, pK-to-K conversion, and active-set pruning |
+| [07_low_rank_covariance.py](07_low_rank_covariance.py) | advanced | Low-rank covariance factors with active-set pruning and diagonal variance repair |
 | [09_monte_carlo_sampling.py](09_monte_carlo_sampling.py) | intermediate | Direct Gaussian-input MC sampling — spends FLOPs to estimate the target directly |
 | [11_antithetic_monte_carlo_sampling.py](11_antithetic_monte_carlo_sampling.py) | intermediate | x/−x Gaussian input pairs for variance reduction at no extra FLOP cost |
 | [12_active_set_sampling.py](12_active_set_sampling.py) | advanced | Pilot pass discovers sparse live layers, then main sampling runs on the active subnetwork |
@@ -35,10 +38,13 @@ from their own directory, so run them from a folder that has the artifact).
 | [31_fixed61440.py](31_fixed61440.py) | milestone | Algorithm 31 fixed N=61,440 (submission 317197, adjusted 1.3086e-7 — previous best; rollback surface) |
 | [32_pow2_65536_fresh_seed.py](32_pow2_65536_fresh_seed.py) | dead | Algorithm 32 power-of-2 N=65,536 with a fresh seed-1005 Sobol artifact (submission 317412: +20.2% — realization luck dominates; offline best-of-8 seed selection did not transfer) |
 | [33_pow2_32768_prefix.py](33_pow2_32768_prefix.py) | dead | Algorithm 33 power-of-2 N=32,768 via same-scramble 2^14-half prefix (submission 317415: +24.4%, raw 18-20% above the 1/n line — no (t,m,d)-net balance dip) |
-| [34_antithetic_pilot.py](34_antithetic_pilot.py) | **best** | Algorithm 34 antithetic pilot probes (submission 317421, adjusted 1.3028e-7 — current best; = the current `estimator.py`) |
+| [34_antithetic_pilot.py](34_antithetic_pilot.py) | milestone | Algorithm 34 antithetic pilot probes (submission 317421, adjusted 1.3028e-7 — previous best) |
 | [34b_pilot_fullblock.py](34b_pilot_fullblock.py) | dead | Pilot probes over all 5,120 half-rows: raw +0.31%, flops +1.04% |
 | [34c_pilot_strided.py](34c_pilot_strided.py) | dead | Even-spread (strided) pilot rows: raw +0.32% at equal flops — Sobol-prefix balance is why probes work |
 | [34d_pilot_halved.py](34d_pilot_halved.py) | dead | Halved pilot (256/1,024 rows): raw +0.99% for flops -0.18% — current sizes are the minimum safe point |
+| [35_put_scatter_only.py](35_put_scatter_only.py) | dead | Algorithm 35 `fnp.put` scatter-only probe (submission 317455: regressed; original eye-matmul scatter is grader-faster) |
+| [36_where_relu_threading.py](36_where_relu_threading.py) | dead | Algorithm 36 `fnp.put` + where-threading bundle (submission 317456: regressed; keep where-threading but reject `fnp.put`) |
+| [37_where_threading_only.py](37_where_threading_only.py) | **best** | Algorithm 37 where-threading only, original scatter kept (submission 317459, adjusted 1.285e-7 — current best; = the current `estimator.py`) |
 
 Full context: `bench_logs/submission_learnings_2026-07-18.md` and `_2026-07-19.md`.
 

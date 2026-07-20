@@ -1,4 +1,12 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
+"""Algorithm 35: put-based scatter only (no where-based ReLU).
+
+Identical to Algorithm 34 except `_scatter` uses `fnp.put` (0-FLOP data
+movement) instead of the `eye[:, idx] @ values` matmul. ReLU remains
+`fnp.maximum`. Paired with Algorithm 36 (max-where variant) to isolate
+whether where-based ReLU + mask threading transfers on the grader.
+
+Original Algorithm 34 header follows.
+Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
 
 Identical to Algorithm 31 (submission 317197) except classification pilot
 probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
@@ -133,7 +141,9 @@ _DENSE_STRASSEN_MIN_OUT = 64
 
 def _scatter(values, idx, width):
     """Functionally place values at idx into a zero vector of length width."""
-    return fnp.eye(width, dtype=fnp.float32)[:, idx] @ values
+    out = fnp.zeros(width, dtype=fnp.float32)
+    fnp.put(out, idx, values)
+    return out
 
 
 def _probe_rows(n_samples: int, fraction: float) -> int:
@@ -412,9 +422,8 @@ def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float, masks
     return dense_t + packed_t, dense_b + packed_b
 
 
-def _block_split_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
-    if masks2 is None:
-        masks2 = (x2[0] > fnp.float32(0.0), x2[1] > fnp.float32(0.0))
+def _block_split_matmul_2blk(x2, weights, layer_idx: int):
+    masks2 = (x2[0] > fnp.float32(0.0), x2[1] > fnp.float32(0.0))
     if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
         return (
             _packed_matmul(x2[0], weights, masks2[0]),
@@ -425,12 +434,9 @@ def _block_split_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
     return _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold, masks2)
 
 
-def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
-    top, bottom = _block_split_matmul_2blk(x2, weights, layer_idx, masks2)
-    mask_top = top > fnp.float32(0.0)
-    mask_bot = bottom > fnp.float32(0.0)
-    x_out = (fnp.where(mask_top, top, fnp.float32(0.0)), fnp.where(mask_bot, bottom, fnp.float32(0.0)))
-    return x_out, (mask_top, mask_bot)
+def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int):
+    top, bottom = _block_split_matmul_2blk(x2, weights, layer_idx)
+    return fnp.maximum(top, 0.0), fnp.maximum(bottom, 0.0)
 
 
 class Estimator(BaseEstimator):
@@ -531,7 +537,6 @@ class Estimator(BaseEstimator):
         mc_rows = []
         prev_idx = None
         x_before_fold = None
-        x_masks = None
 
         for layer_idx, w in enumerate(mlp.weights):
             idx = active_indices[layer_idx]
@@ -543,7 +548,6 @@ class Estimator(BaseEstimator):
                 x = (fnp.zeros((n_samples // 2, 0)), fnp.zeros((n_samples // 2, 0)))
                 prev_idx = idx
                 x_before_fold = None
-                x_masks = None
                 continue
 
             if (
@@ -621,7 +625,7 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                x_kink, x_kink_masks = _block_split_relu_matmul_2blk(x, w_kink, layer_idx, x_masks)
+                x_kink = _block_split_relu_matmul_2blk(x, w_kink, layer_idx)
                 kink_mean = _bmean(x_kink)
 
                 mean_prev = _bmean(x)
@@ -631,7 +635,6 @@ class Estimator(BaseEstimator):
                 mc_rows.append(_scatter(kink_mean, kink_idx, width) + _scatter(on_mean, on_idx, width))
 
                 x = x_kink
-                x_masks = x_kink_masks
                 prev_idx = kink_idx
                 continue
 
@@ -640,7 +643,7 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                pre_from_kink = _block_split_matmul_2blk(x, w_from_kink, layer_idx, x_masks)
+                pre_from_kink = _block_split_matmul_2blk(x, w_from_kink, layer_idx)
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
@@ -699,11 +702,7 @@ class Estimator(BaseEstimator):
                 w_active = w[:, idx]
                 half_rows = n_samples // 2
                 pre_half = _dense_matmul(x[0][:half_rows, :], w_active)
-                mask_pos = pre_half > fnp.float32(0.0)
-                neg_half = -pre_half
-                mask_neg = neg_half > fnp.float32(0.0)
-                x = (fnp.where(mask_pos, pre_half, fnp.float32(0.0)), fnp.where(mask_neg, neg_half, fnp.float32(0.0)))
-                x_masks = (mask_pos, mask_neg)
+                x = (fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0))
             else:
                 w_active = w[prev_idx, :][:, idx]
                 if (
@@ -712,20 +711,15 @@ class Estimator(BaseEstimator):
                     and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
                 ):
                     if _BLOCK_SPLIT_ROWSPARSE:
-                        x, x_masks = _block_split_relu_matmul_2blk(x, w_active, layer_idx, x_masks)
+                        x = _block_split_relu_matmul_2blk(x, w_active, layer_idx)
                     else:
-                        top = _packed_matmul(x[0], w_active, x_masks[0] if x_masks else None)
-                        bot = _packed_matmul(x[1], w_active, x_masks[1] if x_masks else None)
-                        mask_top = top > fnp.float32(0.0)
-                        mask_bot = bot > fnp.float32(0.0)
-                        x = (fnp.where(mask_top, top, fnp.float32(0.0)), fnp.where(mask_bot, bot, fnp.float32(0.0)))
-                        x_masks = (mask_top, mask_bot)
+                        x = (
+                            fnp.maximum(_packed_matmul(x[0], w_active), 0.0),
+                            fnp.maximum(_packed_matmul(x[1], w_active), 0.0),
+                        )
                 else:
                     dt, db = _dense_matmul_2blk(x, w_active)
-                    mask_dt = dt > fnp.float32(0.0)
-                    mask_db = db > fnp.float32(0.0)
-                    x = (fnp.where(mask_dt, dt, fnp.float32(0.0)), fnp.where(mask_db, db, fnp.float32(0.0)))
-                    x_masks = (mask_dt, mask_db)
+                    x = (fnp.maximum(dt, 0.0), fnp.maximum(db, 0.0))
             if _MATERIALIZE_INTERMEDIATE_ROWS or layer_idx >= 30:
                 mc_rows.append(_scatter(_bmean(x), idx, width))
             else:

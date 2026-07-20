@@ -115,3 +115,123 @@ positive-half-only asymmetry (P1).
   flipped); antithetic pilot is free-to-slightly-positive. The 07-19
   power-of-2 line (317412/317415) plus this show: artifact/N changes
   move raw through luck; probe-side changes move only the multiplier.
+
+### Submissions 317455/317456/317459 - ReLU/Scatter FLOP accounting probes
+
+- Result: mixed; where-threading confirmed, put-scatter falsified.
+- Change: 317455 used `fnp.put` for `_scatter` only; 317456 used
+  `fnp.put` plus ReLU masks threaded through `fnp.where`; 317459 used
+  where-threading only and kept the original eye-matmul `_scatter`.
+- Local expectation: `fnp.put` and `fnp.where(mask, ...)` are 0-FLOP in
+  flopscope, but backend/residual overhead was noisy locally.
+- Leaderboard/public evidence: 317455 regressed to adjusted 1.319e-7,
+  raw 2.98e-7, budget 44.43%; 317456 regressed to 1.310e-7, raw
+  2.98e-7, budget 44.07%; 317459 improved to 1.285e-7, raw 2.98e-7,
+  budget 43.28%, effective compute 1.18e11 vs 317421's 1.303e-7,
+  budget 43.91%, effective 1.19e11.
+- Decision: keep where-threading without `fnp.put`; reject put-scatter
+  despite 0 tracked FLOPs because its backend/residual overhead dominates.
+- Lesson: zero-FLOP data movement is not automatically score-positive;
+  use it only when it also removes a charged operation without adding a
+  costly backend path. The original eye-matmul scatter is faster on the
+  grader than `zeros + put`.
+
+### Submission 317460 - where-threading plus redundancy cleanups
+
+- Result: rejected before scoring (smoke test ESTIMATOR_EXCEPTION)
+- Change: 317459 where-threading surface plus exact-output cleanup of unused
+  negative sample-block half, unused final variance/`final_var_mean`, unused
+  intermediate dead-correction/`mc_rows` zeros, redundant intermediate-row
+  combine, rows-only extra block, and closed-form layer-0 analytical moments.
+- Local expectation: analytically strict compute improvement over 317459 with
+  identical final-layer MSE, but tiny tracked-FLOP savings (~7.9M/MLP) relative
+  to residual timing noise.
+- Leaderboard/public evidence: smoke failed with `IndexError` in
+  `alpha_rows[layer_idx]` because the cleanup dropped final-layer alpha and
+  assumed final sampled rows were only `layer_idx >= 30`; smoke MLPs can have
+  shallower depth.
+- Decision: fixed in 317462; keep 317459 as baseline until fixed retry grades.
+- Lesson: even depth-32-specialized leaderboard code must preserve the general
+  `predict()` contract for grader smoke MLPs; keep layer-indexed lists length
+  `mlp.depth` unless every read is guarded, and always materialize
+  `layer_idx == mlp.depth - 1`.
+
+### Submission 317462 - smoke-fixed where-threading cleanup stack
+
+- Result: regressed
+- Change: same as 317460, with smoke fixes: keep `alpha_rows` length equal to
+  `mlp.depth` and materialize the actual final layer row for shallow MLPs.
+- Local expectation: same exact-output public-depth behavior as 317460, but now
+  smoke-safe; validated locally on synthetic depths 1, 2, 3, 4, 8, 32 and
+  subprocess seed42/n1.
+- Leaderboard/public evidence: adjusted 1.309e-7, raw 2.98e-7, budget 44.11%,
+  effective 1.20e11. This regressed vs 317459 (1.285e-7, raw 2.98e-7,
+  budget 43.28%, effective 1.18e11).
+- Decision: reject the broad cleanup stack; keep 317459 as active public-confirmed
+  baseline unless a later one-change public probe improves.
+- Lesson: low-magnitude exact-output cleanup confirmation; public score may be
+  dominated by residual noise despite analytically lower tracked FLOPs.
+
+### Submission 317468 - conservative salvage cleanups
+
+- Result: regressed
+- Change: 317459 where-threading surface plus only the smoke-safe salvage set:
+  array-only `_sample_block` (no unused `-half` tuple), `sorted_nnz[-1]` instead
+  of `fnp.max(nnz_per_row)` after the existing argsort, and removal of unused
+  `final_var_mean`. Original scatter, `fnp.var`, list shapes, and row
+  bookkeeping are unchanged.
+- Local expectation: exact-output; n=3 subprocess vs 317459 saved ~9.77M tracked
+  FLOPs/MLP, ~0.073s residual/MLP, and ~7.32B effective compute/MLP; shallow
+  smoke depths 1/2/3/4/8/32 passed.
+- Leaderboard/public evidence: adjusted 1.311e-7, raw 2.98e-7, budget 44.17%,
+  mean effective 1.20e11. This regressed vs 317459 (1.285e-7, raw 2.98e-7,
+  budget 43.28%, effective 1.18e11) and roughly tied/regressed with 317462.
+- Decision: reject the salvage bundle; keep 317459 as active baseline unless a
+  new isolated public test proves otherwise.
+- Lesson: even locally isolated lower-FLOP/lower-residual cleanup can fail to
+  transfer publicly. For now, submit only one-change isolation artifacts if the
+  hypothesis is strong enough; do not bundle exact-output cleanups.
+- Component attribution after grading: do not fold this into "array-only is
+  bad." Local n=3 array-only had lower FLOPs/wall/residual/effective. The
+  unconfirmed bundled pieces are suspect: isolated n=1 `sorted_nnz[-1]` lowered
+  tracked FLOPs (~1.9M) but worsened wall/residual/effective, and isolated
+  `final_var_mean` removal saved only ~256 FLOPs while worsening residual and
+  effective compute. Treat future tests as one-change public probes only.
+
+### Submission 317472 - isolated array-only sample block
+
+- Result: regressed
+- Change: 317459 where-threading surface plus only `_sample_block` returning the
+  Sobol half array instead of `(half, -half)`; layer 0 indexes `x` directly and
+  downstream layers still use the normal `(top, bottom)` tuple after layer 0.
+- Local expectation: exact-output and smoke-safe; shallow depths 1/2/3/4/8/32
+  passed. Isolated n=3 subprocess vs 317459 had same final MSE with tracked
+  FLOPs -7.86M/MLP, wall -1.82s/MLP, residual -0.141s/MLP, and effective
+  compute -14.08B/MLP. This isolates the most plausible piece from failed 317468.
+- Leaderboard/public evidence: adjusted 1.313e-7, raw 2.98e-7, budget 44.21%,
+  effective 1.20e11. This regressed vs 317459 (1.285e-7, raw 2.98e-7,
+  budget 43.28%, effective 1.18e11) despite local n=3 improvement.
+- Decision: reject array-only as a public-scoring variant for now; do not infer
+  from local residual wins alone.
+- Lesson: use one-change public probes for micro-optimizations; even the cleanest
+  unused-work removal can fail to transfer if the public residual/effective
+  accounting window moves differently.
+
+### Local exact bucket-k fold-in check - no submission yet
+
+- Result: inconclusive/hold
+- Change: on top of array-only, use `k = min(limit, prev_width)` in packed
+  `einsum` groups instead of `_ceil_bucket(limit, 16, prev_width)`.
+- Local expectation: strict billed contraction FLOP reduction for the `limit=8`
+  bucket; expected fp-order drift but raw MSE unchanged at displayed precision.
+- Local evidence: subprocess seed42/n3 vs array-only saved ~55.4M tracked
+  FLOPs/MLP and wall time ~0.016s/MLP, but residual rose ~0.0053s/MLP and
+  effective compute worsened by ~474M/MLP; final MSE drift was ~4.7e-12.
+  Operation profile showed no new calls and `einsum` FLOPs -166M total across
+  n=3, so the local loss is backend/residual attribution rather than an added
+  code path.
+- Decision: do not submit immediately from this machine's n=3 result; consider
+  only as an isolated public probe if a second machine or larger fixed-seed run
+  confirms effective-compute improvement.
+- Lesson: exact bucket-k is analytically clean, but local backend/residual timing
+  can flip. Treat it as a contraction-FLOP idea, not a residual-cleanup idea.

@@ -1,4 +1,16 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
+"""Algorithm 37: public-confirmed where-threading-only surface (submission 317459).
+
+Builds on Algorithm 34 by replacing sampled ReLUs with mask-producing
+`fnp.where` calls and threading those masks into the next packed/block-split
+matmul, eliminating redundant input-positive-mask comparisons. It deliberately
+keeps the original eye-matmul `_scatter`, the original `_sample_block` tuple
+contract, and all row/dead-correction bookkeeping. Public result 317459 improved
+over Algorithm 34/317421 with unchanged raw MSE; later `fnp.put`, array-only
+sample-block, and residual-cleanup bundles regressed publicly and are not part of
+this file.
+
+Original Algorithm 34 header follows.
+Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
 
 Identical to Algorithm 31 (submission 317197) except classification pilot
 probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the

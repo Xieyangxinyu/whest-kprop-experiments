@@ -42,6 +42,32 @@ Kill criteria: <budget exhaustion, slower effective compute, local-only gain, et
 - If a variant only improves all-layer diagnostics while final-layer adjusted score regresses, record that as a negative result for leaderboard purposes.
 - If best results sit at a tuning boundary, widen the range or call the result inconclusive rather than overfitting the boundary.
 
+## Micro-Optimization Isolation Protocol
+
+Use this protocol for exact-output cleanup ideas, FLOP accounting tricks, backend-call reductions, or residual-wall-time hypotheses.
+
+1. Start from the current public-confirmed baseline, not a broad local cleanup stack.
+2. Patch one scientific change per temp estimator folder; avoid bundling changes until each one has isolated evidence.
+3. Before scoring, smoke-test shallow depths such as 1, 2, 3, 4, 8 plus depth 32; grader smoke MLPs are not guaranteed to match public depth.
+4. Run a fixed-seed subprocess n=1 screen. A candidate must keep `n_failed_mlps = 0`, keep `final_layer_mse` unchanged for exact-output ideas, lower `flops_used`, and not worsen `effective_compute`.
+5. Confirm promising n=1 candidates with subprocess n=3 or n=5 before promotion. Reject n=1-only wins that reverse on n=3, even when tracked FLOPs improve.
+6. Inspect both `flops_used` and `residual_wall_time_s`. A 0-FLOP or lower-FLOP change can still regress if backend/residual attribution moves unfavorably.
+7. Submit only public-confirmed or locally isolated candidates that reduce score-relevant effective compute without raw-MSE drift. Record rejected exact-output ideas so they are not re-bundled later.
+
+Current cautionary examples: `fnp.put` scatter reduced tracked FLOPs but regressed publicly; broad list-shape cleanups were smoke-risky; `fnp.var` to mean-of-square looked good at n=1 but worsened effective compute at n=3.
+
+## Experiment Run Hygiene
+
+Use these mechanics to avoid invalid comparisons and wasted reruns.
+
+- For estimators that read `sobol_points.npz`, run variants from folders containing both `estimator.py` and `sobol_points.npz`; do not pass a bare `/tmp/foo.py` copy unless its directory also has the data file. A bare temp file can fail setup by looking for `/tmp/sobol_points.npz`.
+- Give every baseline and variant output a unique, labeled JSON path such as `/tmp/whest_<experiment>_<label>_n3.json`; never overwrite a result you still need for attribution.
+- After a long run, first check each JSON file exists and has nonzero size. Parse the top-level object and handle `{"ok": false, "error": ...}` before reading `results`; setup/smoke failures are not comparable score results.
+- Prefer running baseline and variants under the same command/session when practical, but still save each output separately. If one variant fails, keep the completed outputs and rerun only the missing label.
+- When comparing temp variants, print deltas from saved JSON files rather than re-running immediately. Include `flops_used`, `wall_time_s`, `residual_wall_time_s`, `effective_compute`, `final_layer_mse`, and `n_failed_mlps`.
+- Record the exact baseline source path used for comparison, e.g. public-confirmed `/tmp/whest_37/estimator.py` or current active `estimator.py`; do not mix a failed broad cleanup baseline with a public-confirmed baseline.
+- If a run moved to the background or output was truncated, inspect the saved JSON files directly before rerunning. Terminal tail text can omit the final metrics even when the JSON files are complete.
+
 ## Recording Results
 
 Use the current dated file in `bench_logs/` when the result should be remembered. Include:

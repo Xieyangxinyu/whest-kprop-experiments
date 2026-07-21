@@ -1,4 +1,4 @@
-\section{Problem Setup and Scoring}
+\section{Problem Setup and Notation}
 
 Let $x_0\sim N(0,I)$ and let an MLP of depth $L$ and width $d$ be defined by
 \begin{align}
@@ -9,12 +9,3 @@ The target is the matrix of post-ReLU means
 \begin{align}
     m_\ell = \E[x_\ell]\in\R^d,\qquad \ell=1,\ldots,L.
 \end{align}
-The estimator must return a finite array of shape $(L,d)$. Although all layers must be returned, the Phase 1 leaderboard ranks the adjusted final-layer score. In the notation of the starter kit, the score is the final-layer MSE multiplied by a compute multiplier,
-\begin{align}
-    \textnormal{adjusted score}
-    = \mse(m_L,\widehat m_L)\cdot
-    \max\left\{0.1,\frac{\textnormal{effective compute}}{\textnormal{FLOP budget}}\right\}.
-\end{align}
-Effective compute includes tracked \fnp{} operations as well as residual wall time converted into FLOP-equivalent cost. If a prediction exceeds the combined budget, the evaluator replaces it with zeros. Thus, a useful estimator must be accurate, but it must also stay safely below budget on every MLP.
-
-The submitted estimator optimizes the final-layer mean. Intermediate rows are returned using cheap analytic fillers unless materializing them is necessary for the final-layer computation. This is consistent with the scoring rule, but it means that all-layer MSE is mainly a diagnostic rather than the objective optimized here.

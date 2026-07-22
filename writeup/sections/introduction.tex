@@ -13,8 +13,8 @@ The main ingredients of the submitted estimator are as follows.
 \begin{enumerate}[leftmargin=*]
     \item A diagonal moment-propagation pass that classifies neurons into dead, kink, and on regimes.
     \item A staged active-set refinement scheme that uses small pilot sample prefixes to correct high-impact classification errors, especially in late layers.
-    \item Network-behavior-driven implementation decisions: exact folds for linear on-neurons, dense matmuls for high-fire columns, and packed gather-einsum contractions for genuinely sparse rows.
+    \item Network-behavior-driven implementation decisions: neurons that are almost always active are handled analytically, mostly active groups use standard dense matrix multiplication, and truly sparse groups use a packed computation that skips zero activations.
     \item A compute-oriented implementation that keeps these structural operations inside \fnp{} and treats compute reductions as consequences of the same routing decisions.
 \end{enumerate}
 
-This distinction matters for interpretation. The scientific claim is that much of the final-layer mean can be explained by a small set of structural decisions: which neurons are dead, which are effectively linear, which columns are dense, and which sampled paths remain near a kink. The implementation choices described below are included when they follow from those structural decisions, rather than as a separate story about evaluator-specific accounting.
+In essence, much of the final-layer mean can be explained by a small set of structural decisions: which neurons are dead, which are effectively linear, which columns are dense, and which sampled paths remain near a kink. The implementation choices described below are included when they follow from those structural decisions, rather than as a separate story about evaluator-specific accounting.

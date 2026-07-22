@@ -32,6 +32,24 @@ Writing $\alpha_{\ell,j}=\mu_{\ell,j}^{\rm pre}/\sigma_{\ell,j}^{\rm pre}$ and d
 
 These are the same closed-form ReLU Gaussian moments used in assumed-density filtering for Bayesian neural networks \citep{ghosh2016adf}. The Gaussian assumption here is only an approximation, not an accurate representation of ReLU activations, especially in the later layers. Under Gaussian weight priors, unit-level pre- and post-activation marginals become increasingly heavy-tailed with depth and are characterized by sub-Weibull tails \citep{vladimirova2019understanding}. In this estimator, the Gaussian approximation is useful for producing a simple classification rule. The normalized margin $\alpha_{\ell,j}$ classifies a neuron as dead if $\alpha<-3$, on if $\alpha>3$, and kink otherwise; we have not yet found a reliable way to convert the heavier-tail observation itself into a better mean estimator under the challenge compute budget.
 
+\subsection{Empirical Difficulty Signal for Sample Allocation}
+
+The same data-first view also guided how many samples to spend on a whole MLP. A direct sampling diagnostic asked where final-layer Monte Carlo error is paid. In a matched random MLP, the top $10\%$ of final neurons by mean magnitude carried about half of the expected final-layer sampling variance, and the top $20\%$ carried about $72\%$ (\Cref{fig:final-magnitude-sampling-difficulty}).
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/final_magnitude_sampling_difficulty.png}
+    \caption{Empirical support for the sample-allocation proxy on a matched random ReLU MLP. Under plain Monte Carlo, each neuron's contribution to expected final-layer MSE is proportional to its activation variance divided by sample count. High-magnitude active final neurons carry most of this absolute sampling cost, so a final-layer variance proxy is a natural signal for allocating more samples to harder MLPs.}
+    \label{fig:final-magnitude-sampling-difficulty}
+\end{figure}
+
+The implemented proxy is the final diagonal variance estimate from the same Gaussian pass. It assigns more samples to MLPs whose final layers contain larger active, high-variance neurons:
+\begin{align}
+    N = \clip\left(2\cdot\mathrm{round}\left(\frac{49152}{2}\sqrt{\frac{\bar v_L}{0.02143}}\right),
+    30720,61440\right).
+\end{align}
+The allocation is intentionally smooth. Earlier bucketed or mini-tuned allocations produced local wins, but were less reliable on the public evaluator.
+
 \subsection{Algorithmic Use of the Regime Split}
 
 The regime model determines which sampled coordinates are materialized. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. Kink neurons remain sampled, because their ReLU masks change across samples. On neurons are treated as linear coordinates and can sometimes be folded through later weights.

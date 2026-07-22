@@ -16,6 +16,10 @@ and Phi is the standard normal CDF.
 This estimator propagates the mean and a *diagonal* variance (one scalar per
 neuron, ignoring off-diagonal correlations) through every layer and returns the
 post-ReLU mean for each layer stacked into a (depth, width) array.
+
+It also demonstrates a lightweight active-set idea used by stronger estimators:
+when alpha is very negative, the neuron is treated as dead, its returned mean is
+set to zero, and its moments are not propagated into later layers.
 """
 
 from __future__ import annotations
@@ -24,6 +28,9 @@ import flopscope as flops
 import flopscope.numpy as fnp
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
+
+
+_DEAD_ALPHA_THRESHOLD = -3.0
 
 
 class Estimator(BaseEstimator):
@@ -67,17 +74,26 @@ class Estimator(BaseEstimator):
         # Treat the network input as standard normal: mu=0, var=1 per dimension.
         mu = fnp.zeros(width)  # shape (width,)
         var = fnp.ones(width)  # shape (width,)  — diagonal of the covariance
+        active_idx = None  # indices retained from the previous layer
 
         rows = []
         for w in mlp.weights:  # w has shape (width, width)
+            if active_idx is not None and len(active_idx) == 0:
+                rows.append(fnp.zeros(width))
+                continue
+
+            # Drop rows for previously classified-dead neurons. Their output
+            # moments are treated as zero, so they do not affect later layers.
+            w_active = w if active_idx is None else w[active_idx, :]
+
             # --- Step 2: propagate through the linear layer ---
             # Pre-activation mean:  mu_pre = W^T mu
-            mu_pre = w.T @ mu
+            mu_pre = w_active.T @ mu
 
             # Pre-activation variance (diagonal only):
             #   var_pre[i] = sum_j  W[j,i]^2 * var[j]
             #              = (W^2)^T var
-            var_pre = (w * w).T @ var
+            var_pre = (w_active * w_active).T @ var
 
             # Clamp to avoid division by zero or negative values from rounding.
             var_pre = fnp.maximum(var_pre, 1e-12)
@@ -99,10 +115,19 @@ class Estimator(BaseEstimator):
             #                  + mu_pre * sigma_pre * phi(alpha)
             ez2 = (mu_pre * mu_pre + var_pre) * Phi_alpha + mu_pre * sigma_pre * phi_alpha
             # Var[ReLU] = E[z^2] - E[z]^2  (clamped to 0 for numerical safety)
-            var = fnp.maximum(ez2 - mu * mu, 0.0)
+            var_full = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            # --- Step 6: prune analytically dead neurons ---
+            # A very negative alpha means the Gaussian mass is almost entirely
+            # below zero, so this educational version treats the ReLU as dead.
+            active_mask = alpha >= _DEAD_ALPHA_THRESHOLD
+            active_idx = fnp.nonzero(active_mask)[0]
+            row = fnp.where(active_mask, mu, 0.0)
+            mu = mu[active_idx]
+            var = var_full[active_idx]
 
             # Record the post-ReLU mean for this layer
-            rows.append(mu)
+            rows.append(row)
 
         # Stack all layer means into a single (depth, width) array
         return fnp.stack(rows, axis=0)

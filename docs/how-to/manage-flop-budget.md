@@ -97,26 +97,28 @@ The table below profiles [`examples/02_mean_propagation.py`](../../examples/02_m
 
 | Operation in `predict()` | Calls | FLOPs (total) | % of `predict()` total |
 |---|---:|---:|---:|
-| `mu_pre = w.T @ mu` and `var_pre = (w*w).T @ var` (`matmul`) | 64 | 8,372,224 | **74.7%** |
-| `mu_pre * Phi_alpha + sigma_pre * phi_alpha` etc. (`multiply`) | 256 | 2,154,496 | 19.2% |
-| `flops.stats.norm.cdf(alpha)` | 32 | 393,216 | 3.5% |
-| `flops.stats.norm.pdf(alpha)` | 32 | 221,184 | 2.0% |
-| `mu_pre * Phi_alpha + ...` etc. (`add`) | 96 | 24,576 | 0.2% |
-| `fnp.maximum(var_pre, 1e-12)` (`maximum`) | 64 | 16,384 | 0.1% |
+| `mu_pre = w_active.T @ mu` and `var_pre = (w_active*w_active).T @ var` (`matmul`) | 64 | 7,034,880 | **73.7%** |
+| `mu_pre * Phi_alpha + sigma_pre * phi_alpha` etc. (`multiply`) | 256 | 1,820,160 | 19.1% |
+| `flops.stats.norm.cdf(alpha)` | 32 | 393,216 | 4.1% |
+| `flops.stats.norm.pdf(alpha)` | 32 | 221,184 | 2.3% |
+| `mu_pre * Phi_alpha + ...` etc. (`add`) | 96 | 24,576 | 0.3% |
+| `fnp.maximum(var_pre, 1e-12)` (`maximum`) | 64 | 16,384 | 0.2% |
 | `fnp.sqrt(var_pre)` | 32 | 8,192 | 0.1% |
 | `mu_pre / sigma_pre` (`true_divide`) | 32 | 8,192 | 0.1% |
 | `ez2 - mu*mu` (`subtract`) | 32 | 8,192 | 0.1% |
+| `alpha >= _DEAD_ALPHA_THRESHOLD` (`greater_equal`) | 32 | 8,192 | 0.1% |
+| `fnp.nonzero(active_mask)` (`nonzero`) | 32 | 8,192 | 0.1% |
 | `fnp.stack(rows, axis=0)` | 1 | 0 | 0.0% |
-| **Total per `predict()`** | — | **11,206,656** | — |
+| **Total per `predict()`** | — | **9,551,360** | — |
 
-The full ~11.2 M FLOPs spends only ~0.004% of the 2.72e11 grader budget, so mean propagation lands well below the multiplier floor at this shape — see [Scoring Model](../concepts/scoring-model.md#example-estimator-benchmarks).
+The full ~9.6 M FLOPs spends only ~0.004% of the 2.72e11 grader budget, so mean propagation lands well below the multiplier floor at this shape — see [Scoring Model](../concepts/scoring-model.md#example-estimator-benchmarks).
 
 Two takeaways:
 
-- **`matmul` dominates.** ~77% of `predict()` cost is the two matmuls per layer (the pointwise ReLU-moment terms — `multiply` — are the visible ~20% remainder). Halving the matmul count (e.g., switching to a diagonal-only formulation, or fusing into a single `einsum` like `examples/03_covariance_propagation.py` does for the symmetric cov-update) buys you most of that back.
+- **`matmul` dominates.** ~74% of `predict()` cost is the two matmuls per layer (the pointwise ReLU-moment terms — `multiply` — are the visible ~19% remainder). Reducing matmul dimensions with active-set pruning, switching to a diagonal-only formulation, or fusing into a single `einsum` like `examples/03_covariance_propagation.py` does for the symmetric cov-update buys you most of that back.
 - **Reductions, sqrt, and divides are free in practice.** Don't twist your code to avoid them; the cost is in the tens of FLOPs per layer.
 
-The same pattern holds for `examples/03_covariance_propagation.py`, where the `O(width³)` symmetry-aware `einsum` lands at ~1.6 B FLOPs per `predict()` (~0.6% of the grader budget) — ~150× more expensive than mean propagation (its full covariance is genuinely heavier than mean propagation's diagonal variance), but still leaving plenty of headroom.
+The same pattern holds for `examples/03_covariance_propagation.py`, where active-set pruning brings the `O(width³)` symmetry-aware `einsum` path to ~1.23 B FLOPs per `predict()` (~0.45% of the grader budget) — ~129× more expensive than mean propagation (its full covariance is genuinely heavier than mean propagation's diagonal variance), but still leaving plenty of headroom.
 
 ## Optimization tips
 

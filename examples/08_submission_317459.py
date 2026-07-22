@@ -1,11 +1,23 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-16,384 surface.
+"""Algorithm 37: public-confirmed where-threading-only surface (submission 317459).
+
+Builds on Algorithm 34 by replacing sampled ReLUs with mask-producing
+`fnp.where` calls and threading those masks into the next packed/block-split
+matmul, eliminating redundant input-positive-mask comparisons. It deliberately
+keeps the original eye-matmul `_scatter`, the original `_sample_block` tuple
+contract, and all row/dead-correction bookkeeping. Public result 317459 improved
+over Algorithm 34/317421 with unchanged raw MSE; later `fnp.put`, array-only
+sample-block, and residual-cleanup bundles regressed publicly and are not part of
+this file.
+
+Original Algorithm 34 header follows.
+Algorithm 34: antithetic pilot probes on the fixed-61,440 surface.
 
 Identical to Algorithm 31 (submission 317197) except classification pilot
 probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
 first 512 / 2,048 rows of x[0] AND the matching rows of x[1] (the same
 Sobol points with opposite sign), concatenated -- pair-balanced, so
 odd-order error terms in the alpha mean cancel. Probe row counts, sample
-reuse, artifact (original 30,720-half realization), N = 16,384, packing,
+reuse, artifact (original 30,720-half realization), N = 61,440, packing,
 and routing are all unchanged; only near-threshold classification
 decisions can differ. Local paired evidence (seed 42, 10 MLPs,
 bench_logs/submission_learnings_2026-07-19.md): raw +0.06% (wash, mixed
@@ -15,7 +27,7 @@ instrument for the residual-vs-FLOP machine-speed flip (315844/315892
 lesson); expected grader outcome: tie to +0.3%.
 
 Original Algorithm 31 header follows.
-Algorithm 31: fixed full-artifact sampling (N = 16,384 for every net).
+Algorithm 31: fixed full-artifact sampling (N = 61,440 for every net).
 
 Replaces the analytical-variance sample rule (``N_i = clip(49152 *
 sqrt(V_i / V_ref), 30720, 61440)``) with a constant N: a 10,240-sample
@@ -86,7 +98,7 @@ from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
 _BASE_SAMPLES = 10240
-_TOTAL_SAMPLES = 16384  # 8192 Sobol half-samples x 2 (antithetic)
+_TOTAL_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.05
@@ -313,7 +325,7 @@ def _dense_matmul(x, weights):
     return result
 
 
-def _packed_matmul(x, weights):
+def _packed_matmul(x, weights, positive_mask=None):
     n_rows = x.shape[0]
     prev_width = weights.shape[0]
     out_width = weights.shape[1]
@@ -332,8 +344,7 @@ def _packed_matmul(x, weights):
         stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
         x_chunk = x[start:stop, :]
         chunk_rows = stop - start
-        mask_chunk = x_chunk > fnp.float32(0.0)
-        mask_chunk = mask_chunk.astype(fnp.float32)
+        mask_chunk = positive_mask[start:stop, :] if positive_mask is not None else x_chunk > fnp.float32(0.0)
 
         nnz_per_row = fnp.sum(mask_chunk, axis=1)
         max_nnz = int(fnp.max(nnz_per_row))
@@ -345,7 +356,7 @@ def _packed_matmul(x, weights):
 
         row_order = fnp.argsort(nnz_per_row)
         x_sorted = fnp.take(x_chunk, row_order, axis=0)
-        mask_sorted = x_sorted > fnp.float32(0.0)
+        mask_sorted = fnp.take(mask_chunk, row_order, axis=0)
         sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
         sorted_chunks = all_groups  # group outputs accumulate globally
         group_start = 0
@@ -385,7 +396,7 @@ def _packed_matmul(x, weights):
     return fnp.take(full_sorted, fnp.argsort(global_order), axis=0)
 
 
-def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float):
+def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float, masks2):
     """Row-blocked split matmul: the column split (from the COMBINED fire
     rate) is shared by both blocks; the dense part runs through the
     unassembled 2-block Strassen; the packed part runs per block (rows are
@@ -395,8 +406,8 @@ def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float):
 
     if len(dense_pos) < _BLOCK_SPLIT_MIN_DENSE_COLS or len(sparse_pos) < _BLOCK_SPLIT_MIN_SPARSE_COLS:
         return (
-            _packed_matmul(x2[0], weights),
-            _packed_matmul(x2[1], weights),
+            _packed_matmul(x2[0], weights, masks2[0]),
+            _packed_matmul(x2[1], weights, masks2[1]),
         )
 
     w_dense = fnp.take(weights, dense_pos, axis=0)
@@ -405,10 +416,10 @@ def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float):
         (fnp.take(x2[0], dense_pos, axis=1), fnp.take(x2[1], dense_pos, axis=1)), w_dense
     )
     packed_t = _packed_matmul(
-        fnp.take(x2[0], sparse_pos, axis=1), w_sparse
+        fnp.take(x2[0], sparse_pos, axis=1), w_sparse, fnp.take(masks2[0], sparse_pos, axis=1)
     )
     packed_b = _packed_matmul(
-        fnp.take(x2[1], sparse_pos, axis=1), w_sparse
+        fnp.take(x2[1], sparse_pos, axis=1), w_sparse, fnp.take(masks2[1], sparse_pos, axis=1)
     )
     return dense_t + packed_t, dense_b + packed_b
 
@@ -418,14 +429,12 @@ def _block_split_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
         masks2 = (x2[0] > fnp.float32(0.0), x2[1] > fnp.float32(0.0))
     if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
         return (
-            _packed_matmul(x2[0], weights),
-            _packed_matmul(x2[1], weights),
+            _packed_matmul(x2[0], weights, masks2[0]),
+            _packed_matmul(x2[1], weights, masks2[1]),
         )
-    mask0 = masks2[0].astype(fnp.float32)
-    mask1 = masks2[1].astype(fnp.float32)
-    fire_rate = (fnp.mean(mask0, axis=0) + fnp.mean(mask1, axis=0)) * fnp.float32(0.5)
+    fire_rate = (fnp.mean(masks2[0], axis=0) + fnp.mean(masks2[1], axis=0)) * fnp.float32(0.5)
     threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
-    return _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold)
+    return _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold, masks2)
 
 
 def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
@@ -717,8 +726,8 @@ class Estimator(BaseEstimator):
                     if _BLOCK_SPLIT_ROWSPARSE:
                         x, x_masks = _block_split_relu_matmul_2blk(x, w_active, layer_idx, x_masks)
                     else:
-                        top = _packed_matmul(x[0], w_active)
-                        bot = _packed_matmul(x[1], w_active)
+                        top = _packed_matmul(x[0], w_active, x_masks[0] if x_masks else None)
+                        bot = _packed_matmul(x[1], w_active, x_masks[1] if x_masks else None)
                         mask_top = top > fnp.float32(0.0)
                         mask_bot = bot > fnp.float32(0.0)
                         x = (fnp.where(mask_top, top, fnp.float32(0.0)), fnp.where(mask_bot, bot, fnp.float32(0.0)))

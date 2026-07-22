@@ -29,9 +29,15 @@ Numerical stability:
     linear layer we check the maximum diagonal entry and rescale (mu, cov) if
     it exceeds a threshold, keeping a running log-scale to restore the mean in
     the original coordinates before recording it.
+
+This version also includes the active-set idea used by stronger estimators:
+neurons with very negative alpha are classified as dead, recorded as zero, and
+removed from the mean/covariance state propagated to later layers.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import flopscope as flops
 import flopscope.numpy as fnp
@@ -41,6 +47,7 @@ from whestbench.domain import MLP
 # If any diagonal entry of the covariance exceeds this value we rescale
 # to keep the arithmetic well-behaved in float32.
 _COV_RESCALE_THRESHOLD = 1e100
+_DEAD_ALPHA_THRESHOLD = -3.0
 
 
 class Estimator(BaseEstimator):
@@ -84,10 +91,15 @@ class Estimator(BaseEstimator):
         # Input is modelled as standard multivariate normal: mu=0, cov=I.
         mu = fnp.zeros(width)  # shape (width,)
         cov = fnp.eye(width)  # shape (width, width)
+        active_idx = None  # indices retained from the previous layer
         log_scale = 0.0  # tracks accumulated log of rescaling factor
 
         rows = []
         for w in mlp.weights:  # w has shape (width, width)
+            if active_idx is not None and len(active_idx) == 0:
+                rows.append(fnp.zeros(width))
+                continue
+
             # --- Step 2: overflow prevention ---
             # If the covariance has grown very large, rescale (mu, cov) by the
             # square root of the largest variance so that downstream matmuls
@@ -100,6 +112,10 @@ class Estimator(BaseEstimator):
                 cov = cov / (s * s)
                 log_scale += float(fnp.log(s))
 
+            # Drop rows for previously classified-dead neurons. Their output
+            # moments are treated as zero, so they do not affect later layers.
+            w_active = w if active_idx is None else w[active_idx, :]
+
             # --- Step 3: propagate through the linear layer ---
             # Pre-activation mean:         mu_pre  = W^T mu
             # Pre-activation covariance:   cov_pre = W^T cov W
@@ -111,8 +127,8 @@ class Estimator(BaseEstimator):
             # is also tagged symmetric — no SymmetryLossWarning to suppress.
             # See https://github.com/AIcrowd/whestbench/issues/27 for the
             # background.
-            mu_pre = w.T @ mu
-            cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w, w)
+            mu_pre = w_active.T @ mu
+            cov_pre = fnp.einsum("ij,ia,jb->ab", cov, w_active, w_active)
 
             # Extract per-neuron pre-activation standard deviations from the
             # diagonal of cov_pre.
@@ -141,14 +157,28 @@ class Estimator(BaseEstimator):
             gain = fnp.array(gain_np.astype(fnp.float32))
 
             # Off-diagonal approximation:  cov_post[i,j] ≈ gain[i]*gain[j]*cov_pre[i,j]
-            cov = fnp.multiply(fnp.outer(gain, gain), cov_pre)
+            cov_full = fnp.multiply(fnp.outer(gain, gain), cov_pre)
 
             # Replace the diagonal with the exact marginal variances.
-            fnp.fill_diagonal(cov, var_post)
+            fnp.fill_diagonal(cov_full, var_post)
 
-            # --- Step 8: record mean in original (unscaled) coordinates ---
+            # --- Step 8: prune analytically dead neurons ---
+            # A very negative alpha means the Gaussian mass is almost entirely
+            # below zero, so this educational version treats the ReLU as dead.
+            active_mask = alpha >= _DEAD_ALPHA_THRESHOLD
+            active_idx = fnp.nonzero(active_mask)[0]
+
+            # --- Step 9: record mean in original (unscaled) coordinates ---
             scale_factor = float(fnp.exp(log_scale))
-            rows.append(mu * scale_factor)
+            row = fnp.where(active_mask, mu * scale_factor, 0.0)
+            rows.append(row)
+
+            # Carry only the active sub-covariance into the next layer.
+            mu = mu[active_idx]
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", flops.SymmetryLossWarning)
+                cov_active = cov_full[active_idx, :][:, active_idx]
+            cov = flops.as_symmetric(cov_active, symmetry=(0, 1))
 
         # Stack all layer means into a single (depth, width) array
         return fnp.stack(rows, axis=0)

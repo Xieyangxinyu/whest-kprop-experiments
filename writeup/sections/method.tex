@@ -2,7 +2,9 @@
 
 \subsection{Empirical Regime Collapse into Dead, Kink, and On Neurons}
 
-The first design choice came from inspecting sampled activations before choosing an algorithm. In a representative random ReLU MLP, we drew a large Monte Carlo diagnostic set and recorded each neuron's preactivation range. Three marginal patterns appeared: some neurons stayed below zero on every sampled input, some crossed zero, and some stayed above zero. These are the empirical dead, kink, and on regimes in \Cref{fig:layer-collapse-classification}. The sign-based view is the white-box version of the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}.
+Before choosing an algorithm, we selected a few example MLPs and drew a large number of Monte Carlo samples to visualize the pre-activation distribution for each neuron under Gaussian inputs. We noticed that, particularly for the middle and later layers of the MLP, there were many pre-activation distributions with almost all probability mass below zero, some with substantial probability mass near zero, and others with almost all probability mass above zero. These are the empirical dead, kink, and on regimes in \Cref{fig:layer-collapse-classification}.
+
+As implied by the names, these three regimes are associated with very different post-activation behavior. For a neuron with preactivation $z_{\ell,j}$, if $z_{\ell,j}\leq 0$ throughout the region being propagated, then $x_{\ell,j}=\relu(z_{\ell,j})=0$ and the neuron is dead. If $z_{\ell,j}\geq 0$ throughout that region, then $x_{\ell,j}=z_{\ell,j}$ and the neuron is on, meaning ReLU acts as the identity. Only when a neuron's pre-activation has substantial probability of being both positive and negative is its ReLU behavior uncertain.
 
 \begin{figure}[t]
     \centering
@@ -11,9 +13,8 @@ The first design choice came from inspecting sampled activations before choosing
     \label{fig:layer-collapse-classification}
 \end{figure}
 
-The diagnostic matters because these visual regimes are also algebraic regimes. For a neuron with preactivation $z_{\ell,j}$, if $z_{\ell,j}\leq 0$ throughout the region being propagated, then $x_{\ell,j}=\relu(z_{\ell,j})=0$ and the neuron is dead. If $z_{\ell,j}\geq 0$ throughout that region, then $x_{\ell,j}=z_{\ell,j}$ and the neuron is on, meaning ReLU acts as the identity. Only when the preactivation distribution crosses zero does the nonlinear mask remain uncertain. This is the finite-depth forward version of the ``dying ReLU'' phenomenon studied in initialization and training dynamics \citep{lu2020dyingrelu}; here the point is not optimization failure, but a white-box simplification of the forward computation. The estimator is built around preserving this observed split while spending sampled computation only where it can affect the nonlinear mean estimate.
+By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. The submitted estimator predicts the regimes from the weights with a diagonal Gaussian pass. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
 
-The submitted estimator cannot afford to discover the split from a large diagnostic sample for every evaluated MLP, so it predicts the regimes from the weights with a diagonal Gaussian pass. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
 \begin{align}
     \mu_{\ell,j}^{\rm pre} &= \sum_i W_{\ell,ij}\mu_{\ell-1,i}, \\
     (\sigma_{\ell,j}^{\rm pre})^2 &= \sum_i W_{\ell,ij}^2 v_{\ell-1,i}.
@@ -28,7 +29,8 @@ Writing $\alpha_{\ell,j}=\mu_{\ell,j}^{\rm pre}/\sigma_{\ell,j}^{\rm pre}$ and d
        + \mu_{\ell,j}^{\rm pre}\sigma_{\ell,j}^{\rm pre}\phi(\alpha_{\ell,j})
        - \mu_{\ell,j}^2.
 \end{align}
-These are the same closed-form ReLU Gaussian moments used in assumed-density filtering for Bayesian neural networks \citep{ghosh2016adf}. The Gaussian assumption should not be read as an exact model of deep ReLU unit marginals: under Gaussian weight priors, unit-level pre- and post-activation marginals become increasingly heavy-tailed with depth and are characterized by sub-Weibull tails \citep{vladimirova2019understanding}. In this estimator the Gaussian pass serves the narrower purpose of producing a cheap sign-margin routing rule. The normalized margin $\alpha_{\ell,j}$ classifies a neuron as dead if $\alpha<-3$, on if $\alpha>3$, and kink otherwise; we have not yet found a reliable way to convert the heavier-tail observation itself into a better mean estimator under the challenge compute budget.
+
+These are the same closed-form ReLU Gaussian moments used in assumed-density filtering for Bayesian neural networks \citep{ghosh2016adf}. The Gaussian assumption here is only an approximation, not an accurate representation of ReLU activations, especially in the later layers. Under Gaussian weight priors, unit-level pre- and post-activation marginals become increasingly heavy-tailed with depth and are characterized by sub-Weibull tails \citep{vladimirova2019understanding}. In this estimator, the Gaussian approximation is useful for producing a simple classification rule. The normalized margin $\alpha_{\ell,j}$ classifies a neuron as dead if $\alpha<-3$, on if $\alpha>3$, and kink otherwise; we have not yet found a reliable way to convert the heavier-tail observation itself into a better mean estimator under the challenge compute budget.
 
 \subsection{Algorithmic Use of the Regime Split}
 
@@ -40,7 +42,7 @@ The final two layers use the most direct version of this fold. If neuron $i$ is 
 \end{align}
 Its contribution to a layer-31 preactivation can therefore be composed through $W_{30}$ and $W_{31}$ without materializing the sampled layer-30 column. Layer-30 kink neurons do not satisfy this identity, so their contribution remains sampled.
 
-The boundary between regimes is the main failure mode of a hard classifier. Near a decision boundary, the estimator performs staged pilot checks: a small prefix estimates the sign regime, and an uncertain band is rechecked with a larger prefix before promoting or demoting the neuron. This is especially important near layers 30 and 31, where late classification mistakes directly affect the scored layer.
+One disadvantage of using a classifier is that the boundary between regimes is not always clear. To overcome this shortcoming, a small prefix sample is used to identify neurons near the decision boundary, which are reevaluated using a larger prefix sample before being reassigned if necessary. This verification is particularly important in layers 30 and 31, where classification errors directly affect the scored layer.
 
 \subsection{Empirical Dense/Sparse Blocks in Sampled Activations}
 

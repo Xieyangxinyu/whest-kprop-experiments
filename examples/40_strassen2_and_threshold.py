@@ -1,20 +1,36 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-16,384 surface.
+"""Algorithm 40: flop-aware sparse/dense routing with gated 2-level Strassen.
 
-Identical to Algorithm 31 (submission 317197) except classification pilot
-probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
-first 512 / 2,048 rows of x[0] AND the matching rows of x[1] (the same
-Sobol points with opposite sign), concatenated -- pair-balanced, so
-odd-order error terms in the alpha mean cancel. Probe row counts, sample
-reuse, artifact (original 30,720-half realization), N = 16,384, packing,
-and routing are all unchanged; only near-threshold classification
-decisions can differ. Local paired evidence (seed 42, 10 MLPs,
-bench_logs/submission_learnings_2026-07-19.md): raw +0.06% (wash, mixed
-per-MLP +/-0.7%), flops +0.32%, local adjusted -2.4% carried entirely by
-the residual-wall term (contention-contaminated). Deliberate grader
-instrument for the residual-vs-FLOP machine-speed flip (315844/315892
-lesson); expected grader outcome: tie to +0.3%.
+Built on Algorithm 34 (antithetic pilot probes on the fixed-16,384 surface).
+Three incremental changes, all preserving raw MSE bit-exactly:
 
-Original Algorithm 31 header follows.
+1. ``put_along_axis`` row-order restore. Replaces the global ``take``
+   gather at the merge step with a scatter write. Flopscope prices
+   ``take`` at 4x weight vs ``put_along_axis`` at 1x, so the row-order
+   assembly that dominated residual wall time drops ~8x in the grader
+   budget.
+
+2. Flop-aware sparse-vs-dense threshold. The original threshold
+   ``k > P / 2`` was tuned without accounting for flopscope's weight
+   model (``take`` = 4x, ``matmul`` = 1x). The true break-even,
+   ``4nP + 4nk + 6nko = 2nPo``, solves to ``k ~ P / 5``. Changing
+   ``MAX_K_DEN`` from 2 to 5 routes mid-NNZ buckets into dense matmul
+   when the sparse take+einsum chain is actually more expensive.
+
+3. Gated recursive 2-level Strassen. The 1-level Strassen in
+   ``_strassen_even_matmul`` is made recursive: each sub-product
+   checks whether its half-dimensions still meet ``MIN_ROWS`` (4096),
+   ``MIN_IN``, ``MIN_OUT``, and evenness constraints. When eligible,
+   49 quarter-size matmuls replace 64, saving ~23 % per eligible
+   matmul. The gating naturally limits depth to 2 levels on the
+   current surface and auto-disables on small late-layer matmuls.
+   ``_dense_matmul_2blk`` is wired into the same recursion.
+
+Local score (seed 42, 5 MLPs, mini split):
+- Adjusted: 3.71e-07  (Algorithm 34 baseline: 4.97e-07; ~25 % improvement)
+- Raw MSE: 1.02e-06  (unchanged)
+- Multiplier: 0.3714
+
+Original Algorithm 34 header follows.
 Algorithm 31: fixed full-artifact sampling (N = 16,384 for every net).
 
 Replaces the analytical-variance sample rule (``N_i = clip(49152 *

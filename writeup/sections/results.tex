@@ -1,32 +1,3 @@
-\section{Evidence and Ablations}
+\section{Error Analysis and Results}
 
-\subsection{Public Evaluator Result}
-
-\Cref{tab:public-result} reports the public Phase 1 evaluator result for the submitted artifact and the immediately preceding submitted baseline. The final method improved the adjusted score by $9.0408\%$ while preserving raw final-layer MSE at the reported precision. The gain came almost entirely from the compute multiplier, consistent with the goal of changing how the same sampled computation is routed rather than changing the prediction target.
-
-\begin{table}[h]
-\centering
-\caption{Public Phase 1 evaluator results. The write-up corresponds to the submitted artifact row.}
-\label{tab:public-result}
-\small
-\begin{tabular}{lrrrrr}
-\toprule
-Variant & Adjusted score & Raw final MSE & Multiplier & Effective compute & Failures \\
-\midrule
-Immediate predecessor & $1.002851\!\times\!10^{-7}$ & $3.724967\!\times\!10^{-7}$ & $0.2653999$ & $72.189$G & $0/50$ \\
-Submitted artifact & $9.121856\!\times\!10^{-8}$ & $3.724918\!\times\!10^{-7}$ & $0.2416127$ & $65.719$G & $0/50$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Local Gates Used Before Submission}
-
-The public-mini subprocess checks used fixed seed 42 and profiled the same estimator surface before submission. The dense fallback for high-fire rows improved adjusted score by $12.6\%$ on three MLPs and $13.9\%$ on five MLPs with unchanged raw MSE. The cap-sample wall-time check also timed all public-mini MLPs that reached the sample cap and found no local 60-second failures; the maximum direct wall time among those cap rows was $25.026$s.
-
-These checks were not treated as definitive public scores. Their purpose was narrower: reject variants that changed raw MSE, exceeded wall time, or only improved a noisy local timing signal without reducing tracked compute.
-
-\subsection{Negative Results}
-
-Several plausible extensions were rejected. Packing only pilot/probe matmuls preserved raw final MSE but touched too small a fraction of compute to pay for its overhead. More aggressive approximate compression variants changed the prediction enough that raw final-layer MSE dominated any compute savings on the tested slices. Naive sparse-support variants exposed real support overlap, but were too slow and timed out or regressed on public-mini checks.
-
-These failures are useful because they separate two kinds of progress. Exact routing changes that preserve predictions and reduce the multiplier transfer well. Approximate packing changes need a raw-MSE error below the remaining multiplier gain; otherwise, they lose even when they save counted FLOPs.
+\textcolor{red}{For kink neurons, we wonder whether more accurate propagation-based methods could be developed by parametrizing the distributions more carefully. For instance, multivariate probit models \citep{cragg1971some, chib2001metropolis} might provide a framework for capturing the joint behavior of neurons near the ReLU threshold. For on neurons, we know that they become increasingly heavy-tailed with depth, characterized by sub-Weibull distributions \citep{vladimirova2019understanding}. This suggests that the Gaussian approximation used in our diagonal propagation pass may be systematically underestimating the contribution of on neurons in later layers, even though they are treated as linear. Understanding how to better propagate these heavy-tailed distributions, or how much this approximation error matters in practice, remains an open question.}

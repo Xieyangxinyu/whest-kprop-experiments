@@ -405,13 +405,18 @@ def _packed_matmul(x, weights):
     return out
 
 
-def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float):
-    """Row-blocked split matmul: the column split (from the COMBINED fire
+def _split_matmul_with_fire_2blk(x2, weights, fire_rate, positive_bias):
+    """Row-blocked split matmul: the column split (from the analytic fire
     rate) is shared by both blocks; the dense part runs through the
     unassembled 2-block Strassen; the packed part runs per block (rows are
     independent). Returns (top, bottom)."""
-    dense_pos = fnp.nonzero(fire_rate >= fnp.float32(threshold))[0]
-    sparse_pos = fnp.nonzero(fire_rate < fnp.float32(threshold))[0]
+    N = len(fire_rate)
+    k = int(fnp.ceil(N * positive_bias))
+    if k >= N:
+        k = N - 1
+    fire_sort_idx = fnp.argsort(fire_rate)[::-1]
+    dense_pos = fire_sort_idx[:k]
+    sparse_pos = fire_sort_idx[k:]
 
     if len(dense_pos) < _BLOCK_SPLIT_MIN_DENSE_COLS or len(sparse_pos) < _BLOCK_SPLIT_MIN_SPARSE_COLS:
         return (
@@ -433,7 +438,7 @@ def _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold: float):
     return dense_t + packed_t, dense_b + packed_b
 
 
-def _block_split_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
+def _block_split_matmul_2blk(x2, weights, layer_idx: int, fire_rate, positive_bias, masks2=None):
     if masks2 is None:
         masks2 = (x2[0] > fnp.float32(0.0), x2[1] > fnp.float32(0.0))
     if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
@@ -441,15 +446,11 @@ def _block_split_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
             _packed_matmul(x2[0], weights),
             _packed_matmul(x2[1], weights),
         )
-    mask0 = masks2[0].astype(fnp.float32)
-    mask1 = masks2[1].astype(fnp.float32)
-    fire_rate = (fnp.mean(mask0, axis=0) + fnp.mean(mask1, axis=0)) * fnp.float32(0.5)
-    threshold = _BLOCK_SPLIT_FIRE_THRESH_BY_LAYER.get(layer_idx, _BLOCK_SPLIT_FIRE_THRESH)
-    return _split_matmul_with_fire_2blk(x2, weights, fire_rate, threshold)
+    return _split_matmul_with_fire_2blk(x2, weights, fire_rate, positive_bias)
 
 
-def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int, masks2=None):
-    top, bottom = _block_split_matmul_2blk(x2, weights, layer_idx, masks2)
+def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int, fire_rate, positive_bias, masks2=None):
+    top, bottom = _block_split_matmul_2blk(x2, weights, layer_idx, fire_rate, positive_bias, masks2)
     mask_top = top > fnp.float32(0.0)
     mask_bot = bottom > fnp.float32(0.0)
     x_out = (fnp.where(mask_top, top, fnp.float32(0.0)), fnp.where(mask_bot, bottom, fnp.float32(0.0)))
@@ -481,6 +482,8 @@ class Estimator(BaseEstimator):
         dead_corrections = []
         analytical_rows = []
         alpha_rows = []
+        phi_rows = []
+        positive_bias_rows = []
         mu_post = fnp.zeros(width)
         var_post = fnp.zeros(width)
 
@@ -509,6 +512,8 @@ class Estimator(BaseEstimator):
 
             phi = flops.stats.norm.pdf(alpha)
             Phi = flops.stats.norm.cdf(alpha)
+            phi_rows.append(Phi)
+            positive_bias_rows.append(float(fnp.mean(Phi)))
             mu_post = mu_pre * Phi + sigma_pre * phi
             var_post = (var_pre + mu_pre * mu_pre) * Phi + mu_pre * sigma_pre * phi - mu_post * mu_post
             var_post = fnp.maximum(var_post, 1e-12)
@@ -527,6 +532,8 @@ class Estimator(BaseEstimator):
             "dead_corrections": dead_corrections,
             "analytical_rows": analytical_rows,
             "alpha_rows": alpha_rows,
+            "phi_rows": phi_rows,
+            "positive_bias_rows": positive_bias_rows,
             "final_var_mean": float(fnp.mean(var_post)),
         }
 
@@ -550,6 +557,8 @@ class Estimator(BaseEstimator):
         dead_corrections = list(structure["dead_corrections"])
         analytical_rows = structure["analytical_rows"]
         alpha_rows = structure["alpha_rows"]
+        phi_rows = structure["phi_rows"]
+        positive_bias_rows = structure["positive_bias_rows"]
 
         mc_rows = []
         prev_idx = None
@@ -644,7 +653,9 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                x_kink, x_kink_masks = _block_split_relu_matmul_2blk(x, w_kink, layer_idx, x_masks)
+                fire_rate = phi_rows[layer_idx - 1][prev_idx]
+                pb = positive_bias_rows[layer_idx - 1]
+                x_kink, x_kink_masks = _block_split_relu_matmul_2blk(x, w_kink, layer_idx, fire_rate, pb, x_masks)
                 kink_mean = _bmean(x_kink)
 
                 mean_prev = _bmean(x)
@@ -663,7 +674,9 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                pre_from_kink = _block_split_matmul_2blk(x, w_from_kink, layer_idx, x_masks)
+                fire_rate = phi_rows[layer_idx - 1][prev_idx]
+                pb = positive_bias_rows[layer_idx - 1]
+                pre_from_kink = _block_split_matmul_2blk(x, w_from_kink, layer_idx, fire_rate, pb, x_masks)
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
@@ -729,13 +742,15 @@ class Estimator(BaseEstimator):
                 x_masks = (mask_pos, mask_neg)
             else:
                 w_active = w[prev_idx, :][:, idx]
+                fire_rate = phi_rows[layer_idx - 1][prev_idx]
+                pb = positive_bias_rows[layer_idx - 1]
                 if (
                     _PACKED_ROWSPARSE
                     and (refine or _PACKED_ROWSPARSE_EXTRA_BLOCKS)
                     and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
                 ):
                     if _BLOCK_SPLIT_ROWSPARSE:
-                        x, x_masks = _block_split_relu_matmul_2blk(x, w_active, layer_idx, x_masks)
+                        x, x_masks = _block_split_relu_matmul_2blk(x, w_active, layer_idx, fire_rate, pb, x_masks)
                     else:
                         top = _packed_matmul(x[0], w_active)
                         bot = _packed_matmul(x[1], w_active)
@@ -773,6 +788,8 @@ class Estimator(BaseEstimator):
             "dead_corrections": dead_corrections,
             "analytical_rows": analytical_rows,
             "alpha_rows": alpha_rows,
+            "phi_rows": phi_rows,
+            "positive_bias_rows": positive_bias_rows,
         }
         return rows, refined_structure
 

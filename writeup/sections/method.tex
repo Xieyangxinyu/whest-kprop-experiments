@@ -4,16 +4,7 @@
 
 Before choosing an algorithm, we selected a few example MLPs and drew a large number of Monte Carlo samples to visualize the pre-activation distribution for each neuron under Gaussian inputs. We noticed that, particularly for the middle and later layers of the MLP, there were many pre-activation distributions with almost all probability mass below zero, some with substantial probability mass near zero, and others with almost all probability mass above zero. These are the empirical dead, kink, and on regimes in \Cref{fig:layer-collapse-classification}.
 
-As implied by the names, these three regimes are associated with very different post-activation behavior. For a neuron with preactivation $z_{\ell,j}$, if $z_{\ell,j}\leq 0$ throughout the region being propagated, then $x_{\ell,j}=\relu(z_{\ell,j})=0$ and the neuron is dead. If $z_{\ell,j}\geq 0$ throughout that region, then $x_{\ell,j}=z_{\ell,j}$ and the neuron is on, meaning ReLU acts as the identity. Only when a neuron's pre-activation has substantial probability of being both positive and negative is its ReLU behavior uncertain.
-
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=\linewidth]{figures/layer_collapse_neuron_classification.png}
-    \caption{Monte Carlo diagnostic from the layer-collapse notebook. Neurons are classified by their preactivation range over 20k samples: always-off neurons never fire, always-on neurons pass linearly through ReLU, and near-kink neurons still require sampled nonlinear propagation. The upper panels show the layerwise regime counts; the lower panels show representative single-neuron preactivation marginals from layer 31, making the dead, kink, and on regimes visible at the distribution level.}
-    \label{fig:layer-collapse-classification}
-\end{figure}
-
-By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. The submitted estimator does exactly this, predicting the regimes from the weights with a diagonal Gaussian pass. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
+By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
 
 \begin{align}
     \mu_{\ell,j}^{\rm pre} &= \sum_i W_{\ell,ij}\mu_{\ell-1,i}, \\
@@ -30,27 +21,29 @@ Writing $\alpha_{\ell,j}=\mu_{\ell,j}^{\rm pre}/\sigma_{\ell,j}^{\rm pre}$ and d
        - \mu_{\ell,j}^2.
 \end{align}
 
-These are the same closed-form ReLU Gaussian moments used in assumed-density filtering for Bayesian neural networks \citep{ghosh2016adf}. The Gaussian assumption here is only an approximation, not an accurate representation of ReLU activations, especially in the later layers. Under Gaussian weight priors, unit-level pre- and post-activation marginals become increasingly heavy-tailed with depth and are characterized by sub-Weibull tails \citep{vladimirova2019understanding}. In this estimator, the Gaussian approximation is useful for producing a simple classification rule. The normalized margin $\alpha_{\ell,j}$ classifies a neuron as dead if $\alpha<-3$, on if $\alpha>3$, and kink otherwise; we have not yet found a reliable way to convert the heavier-tail observation itself into a better mean estimator under the challenge compute budget.
+These are the same closed-form ReLU Gaussian moments used in assumed-density filtering for Bayesian neural networks \citep{hernandez2015probabilistic, ghosh2016adf}. The Gaussian assumption here is only an approximation, not an accurate representation of ReLU activations, especially in the later layers. Under Gaussian weight priors, unit-level pre- and post-activation marginals become increasingly heavy-tailed with depth and are characterized by sub-Weibull tails \citep{vladimirova2019understanding}. 
 
-\subsection{Empirical Difficulty Signal for Sample Allocation}
+In this estimator, we use the normalized margin $\alpha_{\ell,j}$ to classify a neuron as dead if $\alpha<-3$, on if $\alpha>3$, and kink otherwise.
 
-When evaluating our estimator, we observed that the final-layer sampling variance is concentrated among a small subset of neurons. In a matched random MLP, the top $10\%$ of final neurons by mean magnitude carried about half of the expected final-layer sampling variance, and the top $20\%$ carried about $72\%$ (\Cref{fig:final-magnitude-sampling-difficulty}).
+% \subsection{Empirical Difficulty Signal for Sample Allocation}
 
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=\linewidth]{figures/final_magnitude_sampling_difficulty.png}
-    \caption{Empirical support for the sample-allocation proxy on a matched random ReLU MLP. Under plain Monte Carlo, each neuron's contribution to expected final-layer MSE is proportional to its activation variance divided by sample count. High-magnitude active final neurons carry most of this absolute sampling cost, so a final-layer variance proxy is a natural signal for allocating more samples to harder MLPs.}
-    \label{fig:final-magnitude-sampling-difficulty}
-\end{figure}
+% When evaluating our estimator, we observed that the final-layer sampling variance is concentrated among a small subset of neurons. In a matched random MLP, the top $10\%$ of final neurons by mean magnitude carried about half of the expected final-layer sampling variance, and the top $20\%$ carried about $72\%$ (\Cref{fig:final-magnitude-sampling-difficulty}).
 
-Based on this finding, we decided to allocate samples strategically across MLPs, assigning more samples to MLPs whose final layers contain larger active, high-variance neurons according to the following rule:
-\begin{align}
-    N = \clip\left(2\cdot\mathrm{round}\left(\frac{49152}{2}\sqrt{\frac{\bar v_L}{0.02143}}\right),
-    30720,61440\right).
-\end{align}
-The allocation is intentionally smooth. Earlier bucketed or mini-tuned allocations produced local wins, but were less reliable on the public evaluator.
+% \begin{figure}[t]
+%     \centering
+%     \includegraphics[width=\linewidth]{figures/final_magnitude_sampling_difficulty.png}
+%     \caption{Empirical support for the sample-allocation proxy on a matched random ReLU MLP. Under plain Monte Carlo, each neuron's contribution to expected final-layer MSE is proportional to its activation variance divided by sample count. High-magnitude active final neurons carry most of this absolute sampling cost, so a final-layer variance proxy is a natural signal for allocating more samples to harder MLPs.}
+%     \label{fig:final-magnitude-sampling-difficulty}
+% \end{figure}
 
-\subsection{Algorithmic Use of the Regime Split}
+% Based on this finding, we decided to allocate samples strategically across MLPs, assigning more samples to MLPs whose final layers contain larger active, high-variance neurons according to the following rule:
+% \begin{align}
+%     N = \clip\left(2\cdot\mathrm{round}\left(\frac{49152}{2}\sqrt{\frac{\bar v_L}{0.02143}}\right),
+%     30720,61440\right).
+% \end{align}
+% The allocation is intentionally smooth. Earlier bucketed or mini-tuned allocations produced local wins, but were less reliable on the public evaluator.
+
+\subsubsection{Algorithmic Use of the Regime Split}
 
 The regime model determines which sampled coordinates are materialized. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. Kink neurons remain sampled, because their ReLU masks change across samples. On neurons are treated as linear in later layers. If neuron $i$ is on at layer 30, then sample by sample
 \begin{align}
@@ -60,9 +53,7 @@ Its contribution to a layer-31 preactivation can therefore be composed through $
 
 One disadvantage of using a classifier is that the boundary between regimes is not always clear. To overcome this shortcoming, a small prefix sample is used to identify neurons near the decision boundary, which are reevaluated using a larger prefix sample before being reassigned if necessary. This verification is particularly important in layers 30 and 31, where classification errors directly affect the scored layer.
 
-\subsection{Empirical Dense/Sparse Blocks in Sampled Activations}
-
-After the dead/kink/on split decides which columns remain, a second diagnostic decides how the surviving sampled activation matrix should be multiplied. For each layer, the sampled post-ReLU activation matrix is reordered by column firing rate, the fraction of Monte Carlo samples for which each neuron is active (i.e., has a positive post-ReLU activation). This reveals a characteristic structure (\Cref{fig:activation-design-matrix}). Dead columns are blank, high-fire columns are dense across sample rows, and the middle columns form a row-dependent sparse block.
+\subsection{Dense/Sparse Blocks in Sampled Activations}
 
 \begin{figure}[p]
     \centering
@@ -71,16 +62,9 @@ After the dead/kink/on split decides which columns remain, a second diagnostic d
     \label{fig:activation-design-matrix}
 \end{figure}
 
-A complementary covariance view shows the rank-collapse backdrop (\Cref{fig:covariance-block-waterfall}). Late-layer covariance concentrates into a small active core surrounded by sparse or nearly diagonal structure. Together, these observations motivate a simple implementation rule: multiply the dense block using conventional dense matrix multiplication, and compute the remaining sparse block using exact row-sparse matrix multiplication, which skips zero entries without approximation.
+The dead/kink/on split reduces compute primarily by removing the computation for dead neurons, but the surviving kink neurons still exhibit substantial sparsity that can be exploited. To understand this structure, we examined the sampled post-ReLU activation matrix for each layer, reordering columns by firing rate—the fraction of Monte Carlo samples for which each neuron is active (i.e., has a positive post-ReLU activation). This reveals a characteristic structure (\Cref{fig:activation-design-matrix}). Dead columns are blank, high-fire columns are dense across sample rows, and the middle columns form a row-dependent sparse block. These observations motivate a simple implementation rule: multiply the dense block using conventional dense matrix multiplication, and compute the remaining sparse block using exact row-sparse matrix multiplication, which skips zero entries without approximation.
 
-\begin{figure}[p]
-    \centering
-    \includegraphics[width=\linewidth]{figures/relu_covariance_block_waterfall.png}
-    \caption{Post-ReLU covariance matrices reordered by dead, near-identity, sparse, and dense blocks across depth in a matched random ReLU MLP. The plot is a rank-collapse diagnostic: the dense correlated core becomes visually distinct in later layers, while a larger sparse tier remains. It supports the same late-layer structural story as the layer-collapse figures, but the fold itself follows from the exact layer-30 always-on linearity condition.}
-    \label{fig:covariance-block-waterfall}
-\end{figure}
-
-\subsection{Formal Sparse Propagation and Sampling}
+\subsubsection{Sample Propagation}
 
 For a sampled activation matrix $X\in\R^{n\times d}$ and weights $W\in\R^{d\times d'}$, each sample row has support
 \begin{align}
@@ -92,8 +76,8 @@ When $|S_r|$ is small, the product $XW$ can be evaluated exactly by gathering on
 \end{align}
 In code this is a packed \texttt{einsum} over gathered values and gathered weights. For high-density rows, the estimator falls back to dense matmul because the gather overhead and larger sparse contraction no longer pay for themselves. The dense/sparse split is exact: it changes the route used to compute the sampled product, not the sampled estimator being evaluated.
 
-For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithetic pairing. The \sobol{} sequence is a standard low-discrepancy variance-reduction ingredient, not a unique contribution of this submission \citep{sobol1967distribution}. The antithetic pair uses the Gaussian symmetry $z\mapsto -z$, a classical way to encourage cancellation between paired Monte Carlo evaluations \citep[Section~8.2]{owen2013montecarlo}. Related randomized-QMC approaches were also discussed by other challenge participants, including randomized lattice/Sobol comparisons and Rao-Blackwellization for post-ReLU activation means \citep{aicrowdRqmcRaoBlackwell2026}. Only half of the Gaussianized points are stored; the first-layer symmetry reconstructs the paired activations exactly after the first matmul. The base block uses $30720$ effective samples. Harder MLPs continue with the next \sobol{} prefix up to $61440$ samples.
+We use a global column-firing threshold of 0.5 to partition dense and sparse blocks. Large dense matrix products are further accelerated with a guarded one-level Strassen multiplication \citep{strassen1969gaussian}. 
 
-\subsection{Submitted Implementation Decisions}
+\subsection{Quasi Monte Carlo}
 
-The submitted artifact uses a global column-firing threshold of 0.5 to partition dense and sparse blocks, as this provided the best compute–accuracy trade-off in local public-mini experiments. Large dense matrix products are further accelerated with a guarded one-level Strassen multiplication \citep{strassen1969gaussian}. This is downstream of the mechanism above: the network-structure decisions determine which products are computed, and Strassen reduces the cost of sufficiently large dense products without changing the estimator's interpretation.
+For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithetic pairing. The \sobol{} sequence is a standard low-discrepancy variance-reduction ingredient \citep{sobol1967distribution}. The antithetic pair uses the Gaussian symmetry $z\mapsto -z$ to encourage cancellation between paired Monte Carlo evaluations \citep[Section~8.2]{owen2013montecarlo}. Related randomized-QMC approaches were also discussed by other challenge participants, including randomized lattice/Sobol comparisons and Rao-Blackwellization for post-ReLU activation means \citep{aicrowdRqmcRaoBlackwell2026}. Only half of the Gaussianized points are stored; the first-layer symmetry reconstructs the paired activations exactly after the first matmul. The base block uses $30720$ effective samples. Harder MLPs continue with the next \sobol{} prefix up to $61440$ samples.

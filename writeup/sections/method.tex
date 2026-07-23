@@ -13,7 +13,7 @@ As implied by the names, these three regimes are associated with very different 
     \label{fig:layer-collapse-classification}
 \end{figure}
 
-By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. The submitted estimator predicts the regimes from the weights with a diagonal Gaussian pass. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
+By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. The submitted estimator does exactly this, predicting the regimes from the weights with a diagonal Gaussian pass. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
 
 \begin{align}
     \mu_{\ell,j}^{\rm pre} &= \sum_i W_{\ell,ij}\mu_{\ell-1,i}, \\
@@ -34,7 +34,7 @@ These are the same closed-form ReLU Gaussian moments used in assumed-density fil
 
 \subsection{Empirical Difficulty Signal for Sample Allocation}
 
-The same data-first view also guided how many samples to spend on a whole MLP. A direct sampling diagnostic asked where final-layer Monte Carlo error is paid. In a matched random MLP, the top $10\%$ of final neurons by mean magnitude carried about half of the expected final-layer sampling variance, and the top $20\%$ carried about $72\%$ (\Cref{fig:final-magnitude-sampling-difficulty}).
+When evaluating our estimator, we observed that the final-layer sampling variance is concentrated among a small subset of neurons. In a matched random MLP, the top $10\%$ of final neurons by mean magnitude carried about half of the expected final-layer sampling variance, and the top $20\%$ carried about $72\%$ (\Cref{fig:final-magnitude-sampling-difficulty}).
 
 \begin{figure}[t]
     \centering
@@ -43,7 +43,7 @@ The same data-first view also guided how many samples to spend on a whole MLP. A
     \label{fig:final-magnitude-sampling-difficulty}
 \end{figure}
 
-The implemented proxy is the final diagonal variance estimate from the same Gaussian pass. It assigns more samples to MLPs whose final layers contain larger active, high-variance neurons:
+Based on this finding, we decided to allocate samples strategically across MLPs, assigning more samples to MLPs whose final layers contain larger active, high-variance neurons according to the following rule:
 \begin{align}
     N = \clip\left(2\cdot\mathrm{round}\left(\frac{49152}{2}\sqrt{\frac{\bar v_L}{0.02143}}\right),
     30720,61440\right).
@@ -52,9 +52,7 @@ The allocation is intentionally smooth. Earlier bucketed or mini-tuned allocatio
 
 \subsection{Algorithmic Use of the Regime Split}
 
-The regime model determines which sampled coordinates are materialized. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. Kink neurons remain sampled, because their ReLU masks change across samples. On neurons are treated as linear coordinates and can sometimes be folded through later weights.
-
-The final two layers use the most direct version of this fold. If neuron $i$ is on at layer 30, then sample by sample
+The regime model determines which sampled coordinates are materialized. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. Kink neurons remain sampled, because their ReLU masks change across samples. On neurons are treated as linear in later layers. If neuron $i$ is on at layer 30, then sample by sample
 \begin{align}
     x_{30,i}=z_{30,i}=(x_{29}W_{30})_i.
 \end{align}
@@ -64,7 +62,7 @@ One disadvantage of using a classifier is that the boundary between regimes is n
 
 \subsection{Empirical Dense/Sparse Blocks in Sampled Activations}
 
-After the dead/kink/on split decides which columns remain, a second diagnostic decides how the surviving sampled activation matrix should be multiplied. Sorting each layer's sampled post-ReLU design matrix by column firing rate makes the computational structure visible (\Cref{fig:activation-design-matrix}). Dead columns are blank, high-fire columns are dense across sample rows, and the middle columns form a row-dependent sparse block.
+After the dead/kink/on split decides which columns remain, a second diagnostic decides how the surviving sampled activation matrix should be multiplied. For each layer, the sampled post-ReLU activation matrix is reordered by column firing rate, the fraction of Monte Carlo samples for which each neuron is active (i.e., has a positive post-ReLU activation). This reveals a characteristic structure (\Cref{fig:activation-design-matrix}). Dead columns are blank, high-fire columns are dense across sample rows, and the middle columns form a row-dependent sparse block.
 
 \begin{figure}[p]
     \centering
@@ -73,7 +71,7 @@ After the dead/kink/on split decides which columns remain, a second diagnostic d
     \label{fig:activation-design-matrix}
 \end{figure}
 
-A complementary covariance view shows the rank-collapse backdrop (\Cref{fig:covariance-block-waterfall}). Late-layer covariance concentrates into a small active core surrounded by sparse or nearly diagonal structure. Together, these diagnostics motivate a concrete implementation rule: route high-fire columns to dense matmul and route the remaining sparse block to exact row-sparse contractions.
+A complementary covariance view shows the rank-collapse backdrop (\Cref{fig:covariance-block-waterfall}). Late-layer covariance concentrates into a small active core surrounded by sparse or nearly diagonal structure. Together, these observations motivate a simple implementation rule: multiply the dense block using conventional dense matrix multiplication, and compute the remaining sparse block using exact row-sparse matrix multiplication, which skips zero entries without approximation.
 
 \begin{figure}[p]
     \centering
@@ -98,6 +96,4 @@ For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithet
 
 \subsection{Submitted Implementation Decisions}
 
-The submitted artifact turns the diagnostics above into a small set of routing decisions. Dead neurons are filled analytically or pruned from the sampled state, on-neurons are folded as linear maps when the identity is exact enough to use, high-fire columns are treated as dense blocks, and the remaining rows are evaluated by exact sparse contractions. Column firing rates provide the dense/sparse split: columns that fire frequently are routed into a dense block, while low-fire columns remain in the packed sparse block. The submitted artifact used a global fire threshold of $0.5$, selected because it gave the best raw-MSE-preserving compute tradeoff in local public-mini checks.
-
-One lower-level choice then makes the structurally chosen dense products cheaper. Large dense sampled matmuls use a guarded one-level Strassen contraction \citep{strassen1969gaussian} when the matrix shape is large enough. This is downstream of the mechanism above: the network-structure decisions determine which products are computed, and Strassen reduces the cost of sufficiently large dense products without changing the estimator's interpretation.
+The submitted artifact uses a global column-firing threshold of 0.5 to partition dense and sparse blocks, as this provided the best compute–accuracy trade-off in local public-mini experiments. Large dense matrix products are further accelerated with a guarded one-level Strassen multiplication \citep{strassen1969gaussian}. This is downstream of the mechanism above: the network-structure decisions determine which products are computed, and Strassen reduces the cost of sufficiently large dense products without changing the estimator's interpretation.

@@ -1,3 +1,51 @@
-\section{Error Analysis and Results}
+\section{Results, Limitations, and Future Work}
 
-\textcolor{red}{For kink neurons, we wonder whether more accurate propagation-based methods could be developed by parametrizing the distributions more carefully. For instance, multivariate probit models \citep{cragg1971some, chib2001metropolis} might provide a framework for capturing the joint behavior of neurons near the ReLU threshold. For on neurons, we know that they become increasingly heavy-tailed with depth, characterized by sub-Weibull distributions \citep{vladimirova2019understanding}. This suggests that the Gaussian approximation used in our diagonal propagation pass may be systematically underestimating the contribution of on neurons in later layers, even though they are treated as linear. Understanding how to better propagate these heavy-tailed distributions, or how much this approximation error matters in practice, remains an open question.}
+\subsection{Where the final-layer error lives}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{figures/final_layer_error_by_class.png}
+    \caption{Final-layer error by neuron class (50 public mini networks). Always-on neurons carry 78.0\% of the total squared error, kink neurons 21.4\%, dead neurons 0.5\%.}
+    \label{fig:error-by-class}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.62\linewidth]{figures/final_layer_error_concentration.png}
+    \caption{Cumulative final-layer squared error by output-magnitude rank (same 50 networks): the top 10\% of neurons carry 46\% of the squared error, the top 20\% carry 66\%.}
+    \label{fig:error-concentration}
+\end{figure}
+
+All measurements in this section use the submitted estimator ($N = 61{,}440$ Sobol samples) on 50 of the 100 public mini networks (even ids 0--98); for distribution-level measurements we take four of these (ids 0, 32, 66, 98) and draw 16{,}384 antithetic samples each.\footnote{All figures and statistics are produced by \texttt{estimator\_error\_attribution\_algo34.ipynb} in the repository.} Since only final-layer error is scored, we restrict attention to the final layer, where the median MSE is $2.9\times10^{-7}$ (mean $4.3\times10^{-7}$).
+
+When we analyze the final-layer squared error by neuron class (\Cref{fig:error-by-class}), always-on neurons turn out to carry nearly all of it---78.0\% of the total, against 21.4\% for kink neurons and just 0.5\% for dead ones. This is not because on neurons are more numerous but because they are bigger: their outputs average $\approx 1.5$ in magnitude versus $\approx 0.17$ for kink neurons, so even modest relative errors on the on block dominate everything else. The concentration continues within the on block itself (\Cref{fig:error-concentration}), where the top 10\% of neurons by output magnitude account for 46\% of the squared error and the top 20\% for 66\%.
+
+\subsection{Direction and driver of the on-neuron error}
+
+Is the on-block error bias or just noise? Pooled over the 50 networks, the mean signed error is $-2.1\times10^{-6}$---more than two orders of magnitude below the error spread of $1.1\times10^{-3}$---so it has no meangingful direction. There is a slight lean toward under-estimation (52.3\% of on neurons land below the truth, as do 29 of the 50 networks), but this is a median effect rather than a bias: frequent small undershoots are balanced by rarer, larger overshoots, so more than half of realizations land low. Because all 256 outputs share the same sample points, each network additionally picks up a common shift, which is why whole networks (not just neurons) lean one way. Further analysis also indciates that the size of the error also matches what sampling variance predicts. 
+
+\subsection{Limitations and future work}
+
+\begin{figure}[t]
+    \centering
+    \begin{minipage}{0.49\linewidth}
+        \includegraphics[width=\linewidth]{figures/on_neuron_kurtosis_depth.png}
+    \end{minipage}\hfill
+    \begin{minipage}{0.49\linewidth}
+        \includegraphics[width=\linewidth]{figures/on_neuron_skewness_depth.png}
+    \end{minipage}
+    \caption{Excess kurtosis (left) and skewness (right) of on-neuron post-ReLU activations versus depth (four probe networks; thin lines are individual networks, bold their mean). Both grow with depth, consistent with sub-Weibull tails.}
+    \label{fig:heavy-tails}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.62\linewidth]{figures/kink_preactivation_correlation.png}
+    \caption{Mean absolute pairwise correlation of kink-neuron pre-activations versus depth (same four probe networks), growing from $\approx 0.13$ in early layers to $\approx 0.21$ in late layers.}
+    \label{fig:kink-correlation}
+\end{figure}
+
+Prior work shows that on-neuron activations become increasingly heavy-tailed with depth, following sub-Weibull distributions \citep{vladimirova2019understanding}. We see this directly, if modestly at this width: both skewness and excess kurtosis grow with depth (\Cref{fig:heavy-tails}). These heavy tails expose a limitation of the diagonal Gaussian propagation pass. In deeper layers, it overestimates on-neuron means ($+1.5\%$ in late layers, $+1.8\%$ at the final layer), while its Gaussian tail underestimates the clipping probability by roughly a factor of two. The submitted estimator largely eliminates this error: kink neurons are sampled, on neurons are eventually treated linearly, and the analytical pass survives only in classification and the dead-neuron correction. How to propagate heavy-tailed distributions well remains an open question.
+
+For kink neurons, a natural next step is to parametrize their joint distribution more carefully, for instance with multivariate probit models \citep{cragg1971some, chib2001metropolis}. There is a clear signal to exploit here: kink pre-activations are substantially cross-correlated, and the coupling grows with depth (\Cref{fig:kink-correlation}). Near-threshold neurons tend to cross the kink together---a joint event that independent-marginal propagation cannot represent.
+3

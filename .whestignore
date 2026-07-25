@@ -53,6 +53,10 @@ submission-*.tar.gz
 *_cache.npz
 relu_moment_propagation.py
 prokpt.txt
-submission.tar.gz
 .ab_*.py
 sobol_points_ext*.npz
+
+# Extra files not imported by estimator
+profile_estimator.py
+eval_variants.py
+artifacts/

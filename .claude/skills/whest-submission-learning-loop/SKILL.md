@@ -50,6 +50,26 @@ This is a post-submission workflow. It complements `whest-submission-review`, wh
 - Lesson: <one sentence>
 ```
 
+## Retrieving Scores
+
+**Never use `webfetch` or browser scraping on AIcrowd submission pages.** The submission page is a React SPA — the score data is embedded in obfuscated JavaScript bundles and won't render without a headful browser. `webfetch` returns only skeleton HTML with no score values.
+
+Instead, retrieve scores using one of these methods:
+
+1. **`whest submit --watch` (preferred):** The CLI streams the grading status and prints the final score directly:
+   ```
+   ✓ Graded — score 1.7678734432755242e-07
+   ```
+
+2. **`whest submit --watch` on a previously-submitted id:** If you already have a submission id and want to re-watch:
+   ```bash
+   uv run whest submit --watch --submission-id <id>
+   ```
+
+3. **Leaderboard page:** The public leaderboard at `https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/leaderboard` is also a React SPA and cannot be scraped with `webfetch`. Scores must be read manually by the user in a real browser.
+
+4. **Post-submission CLI output:** The immediate output of `whest submit --watch` is the canonical automated source. If the user closed the terminal before grading finished, re-watch with `--submission-id`.
+
 ## Guardrails
 
 - Do not continue a sequence of submissions without updating the learning log.

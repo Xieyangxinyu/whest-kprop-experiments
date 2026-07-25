@@ -1,57 +1,4 @@
-"""Algorithm 34: antithetic pilot probes on the fixed-16,384 surface.
-
-Identical to Algorithm 31 (submission 317197) except classification pilot
-probes (`_sample_alpha`) estimate alpha from BOTH antithetic halves: the
-first 512 / 2,048 rows of x[0] AND the matching rows of x[1] (the same
-Sobol points with opposite sign), concatenated -- pair-balanced, so
-odd-order error terms in the alpha mean cancel. Probe row counts, sample
-reuse, artifact (original 30,720-half realization), N = 16,384, packing,
-and routing are all unchanged; only near-threshold classification
-decisions can differ. Local paired evidence (seed 42, 10 MLPs,
-bench_logs/submission_learnings_2026-07-19.md): raw +0.06% (wash, mixed
-per-MLP +/-0.7%), flops +0.32%, local adjusted -2.4% carried entirely by
-the residual-wall term (contention-contaminated). Deliberate grader
-instrument for the residual-vs-FLOP machine-speed flip (315844/315892
-lesson); expected grader outcome: tie to +0.3%.
-
-Original Algorithm 31 header follows.
-Algorithm 31: fixed full-artifact sampling (N = 16,384 for every net).
-
-Replaces the analytical-variance sample rule (``N_i = clip(49152 *
-sqrt(V_i / V_ref), 30720, 61440)``) with a constant N: a 10,240-sample
-base block (refined classification) plus one 51,200-sample continuation
-block, merged sample-count-weighted. This reproduces bit-exactly the
-execution path that submission 317172 graded (adjusted 1.3109e-7, raw
-2.9772e-7, multiplier 0.44127) when Algorithm 30's flop metering failed
-remotely and fell back to the full artifact.
-
-Why fixed N: per-net FLOP budgets are separable (no shared budget), so
-the sqrt-variance allocation optimized a nonexistent objective; the
-separable per-net optimum is ~constant N, the adjusted(N) bowl is ~4%
-deep across 14k-61k, and only the full-length Sobol prefix realization
-is leaderboard-validated (same-day pair 317172 vs 317185: -3.9%).
-See bench_logs/submission_learnings_2026-07-18.md. Sampling surface,
-classification, packing, and Strassen routing are unchanged from
-Algorithm 21 / submission 316405. (Unrelated to the retired
-"Algorithm 31" unpack idea noted 2026-07-17 - that number was never
-assigned.)
-
-Original Algorithm 21 header follows.
-Algorithm 21: layer-wise block-split fire thresholds on the finer-row-buckets surface.
-
-Builds on Algorithm 17 / submission 315824. The single _BLOCK_SPLIT_FIRE_THRESH
-(0.75) is replaced by a per-layer map fitted from a 4-net fire-rate census
-(nets 0-3, mini split): a column firing at rate f costs ~1.94*f per
-row-output in the packed path vs ~1.76 flat in the Strassen dense block, so
-the FLOP crossover sits near f=0.91, not 0.75 - and the optimum is
-layer-dependent because small dense blocks miss the Strassen MIN_IN=64
-discount (layer 31 packs everything). Routing is exact: raw MSE is
-bit-identical; measured flops -0.90% on the fit nets, -0.72% on holdout
-nets 4-12. A global threshold shift is measurably flat - only the per-layer
-map wins.
-
-Original Algorithm 17 header follows.
-Algorithm 17: finer antithetic row buckets for block-split row-sparse propagation.
+"""Algorithm 17: Strassen-accelerated active propagation.
 
 This estimator starts from a 30,720-sample prefix. It refines active/dead/on
 classification with staged pilot probes, then uses analytical final-layer
@@ -61,23 +8,19 @@ with the next Sobol prefix; easier MLPs keep the shorter estimate. The final row
 is sampled accurately, while intermediate returned rows are cheap analytical
 fillers because the leaderboard scores only the final layer.
 
-Compared with the original argpartition row-sparse surface, sampled active
-propagation splits ordinary active matmuls into a dense high-fire block and a
-packed low-fire block. All samples still pass through exactly; the split only
-changes how the same sample-by-weight matmul is evaluated. The same split is
-used for both the base/refinement sample block and any extra continuation block.
-The special layer-30/31 fold from Algorithm 15 is kept, with block-split matmuls
-applied to its sampled kink paths. Large dense sampled matmuls use a guarded
-one-level Strassen contraction, while classification probes stay on plain dense
-matmul to avoid probe-path overhead.
-Submission 315718 added mask reuse and a `put_along_axis` row-order restore.
-Submission 315824 added finer row buckets around half-density antithetic layer-1
-rows (`112, 144, 160, 176`) as a submission-safe way to recover part of the
-rejected private antithetic pair-complement optimization.
+Compared with Algorithm 15, the dominant sample-propagation matmuls are computed
+with an exact one-level Strassen decomposition (7 sub-matmuls instead of 8) using
+only flopscope-native ops, so the unmodified accounting library counts the genuine
+reduction in scalar multiplies. Odd dims are zero-padded (exact, FLOP-free) and
+small contractions fall back to a plain matmul. Unlike the Algorithm 16 row-sparse
+packing path, Strassen needs no per-row weight gather, so it avoids the large
+residual-wall-time cost that gather incurs (flopscope charges the gather as free
+indexing, leaving its multi-GB wall-time in residual).
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import flopscope as flops
@@ -85,8 +28,11 @@ import flopscope.numpy as fnp
 from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
-_BASE_SAMPLES = 10240
-_TOTAL_SAMPLES = 16384  # 8192 Sobol half-samples x 2 (antithetic)
+_BASE_SAMPLES = 30720
+_ANCHOR_SAMPLES = 49152
+_MAX_SAMPLES = 61440  # 30720 Sobol half-samples x 2 (antithetic)
+_EASY_SAMPLES = 30720
+_VAR_REF = 0.02143
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.05
@@ -103,32 +49,14 @@ _DEMOTE_ACTIVE_DEAD_STOP_LAYER = 29
 _ACTIVE_DEAD_PROBE_MAX = -2.5
 _ACTIVE_DEAD_THRESH = -3.0
 _MATERIALIZE_INTERMEDIATE_ROWS = False
-_PACKED_ROWSPARSE = True
+_PACKED_ROWSPARSE = False
 _PACKED_ROWSPARSE_START_LAYER = 1
 _PACKED_ROWSPARSE_STOP_LAYER = 29
-_PACKED_ROWSPARSE_CHUNK_ROWS = 16384
+_PACKED_ROWSPARSE_CHUNK_ROWS = 2048
 _PACKED_ROWSPARSE_BUCKET = 16
-_PACKED_ROWSPARSE_ROW_BUCKETS = (0, 8, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192)
-_PACKED_ROWSPARSE_MAX_K_NUM = 1
-_PACKED_ROWSPARSE_MAX_K_DEN = 5
-_PACKED_ROWSPARSE_EXTRA_BLOCKS = True
-_BLOCK_SPLIT_ROWSPARSE = True
-_BLOCK_SPLIT_FIRE_THRESH = 0.75
-# Per-layer overrides fitted on the nets 0-3 fire-rate census (fire_oracle),
-# holdout-validated on nets 4-12; layers absent here fall back to the default.
-_BLOCK_SPLIT_FIRE_THRESH_BY_LAYER = {
-    2: 0.825, 3: 0.925, 4: 0.95, 5: 0.8, 6: 0.825, 7: 0.825, 8: 0.85,
-    9: 0.875, 10: 0.9, 11: 0.875, 12: 0.9, 13: 0.875, 14: 0.925,
-    15: 0.85, 16: 0.8, 17: 0.9, 18: 0.8, 19: 0.875, 20: 0.925,
-    21: 0.925, 22: 0.925, 23: 0.95, 24: 0.925, 25: 0.9, 26: 0.925,
-    27: 0.95, 28: 0.75, 29: 0.7, 30: 0.8, 31: 1.0,
-}
-_BLOCK_SPLIT_MIN_DENSE_COLS = 32
-_BLOCK_SPLIT_MIN_SPARSE_COLS = 16
-_DENSE_STRASSEN = True
-_DENSE_STRASSEN_MIN_ROWS = 4096
-_DENSE_STRASSEN_MIN_IN = 64
-_DENSE_STRASSEN_MIN_OUT = 64
+_PACKED_ROWSPARSE_MAX_K_NUM = 3
+_PACKED_ROWSPARSE_MAX_K_DEN = 4
+_PACKED_ROWSPARSE_EXTRA_BLOCKS = False
 
 
 def _scatter(values, idx, width):
@@ -136,12 +64,18 @@ def _scatter(values, idx, width):
     return fnp.eye(width, dtype=fnp.float32)[:, idx] @ values
 
 
+def _choose_samples(final_var_mean: float) -> int:
+    scaled = _ANCHOR_SAMPLES * math.sqrt(max(final_var_mean, 1e-30) / _VAR_REF)
+    samples = int(round(scaled / 2.0) * 2)
+    return max(_EASY_SAMPLES, min(_MAX_SAMPLES, samples))
+
+
 def _probe_rows(n_samples: int, fraction: float) -> int:
     return max(2, min(n_samples, int(n_samples * fraction)))
 
 
-def _sample_alpha(x2, weights, rows: int):
-    pre = fnp.concatenate([x2[0][:rows, :] @ weights, x2[1][:rows, :] @ weights], axis=0)
+def _sample_alpha(x, weights, rows: int):
+    pre = x[:rows, :] @ weights
     mean = fnp.mean(pre, axis=0)
     var = fnp.var(pre, axis=0)
     return mean / fnp.sqrt(fnp.maximum(var, 1e-12))
@@ -178,283 +112,98 @@ def _ceil_bucket(value: int, bucket: int, limit: int) -> int:
     return min(limit, max(0, bucketed))
 
 
-_STRASSEN_MAX_RECURSE_DEPTH = 1
-
-def _strassen_even_matmul(x, weights, depth=0):
-    half_rows = x.shape[0] // 2
-    half_in = weights.shape[0] // 2
-    half_out = weights.shape[1] // 2
-
-    recurse = (
-        depth < _STRASSEN_MAX_RECURSE_DEPTH
-        and half_rows >= _DENSE_STRASSEN_MIN_ROWS
-        and half_in >= _DENSE_STRASSEN_MIN_IN
-        and half_out >= _DENSE_STRASSEN_MIN_OUT
-        and (half_rows % 2) == 0
-        and (half_in % 2) == 0
-        and (half_out % 2) == 0
-    )
-
-    def _prod(a, b):
-        if recurse:
-            return _strassen_even_matmul(a, b, depth + 1)
-        return a @ b
-
-    x11 = x[:half_rows, :half_in]
-    x12 = x[:half_rows, half_in:]
-    x21 = x[half_rows:, :half_in]
-    x22 = x[half_rows:, half_in:]
-
-    w11 = weights[:half_in, :half_out]
-    w12 = weights[:half_in, half_out:]
-    w21 = weights[half_in:, :half_out]
-    w22 = weights[half_in:, half_out:]
-
-    prod1 = _prod(x11 + x22, w11 + w22)
-    prod2 = _prod(x21 + x22, w11)
-    prod3 = _prod(x11, w12 - w22)
-    prod4 = _prod(x22, w21 - w11)
-    prod5 = _prod(x11 + x12, w22)
-    prod6 = _prod(x21 - x11, w11 + w12)
-    prod7 = _prod(x12 - x22, w21 + w22)
-
-    out11 = prod1 + prod4 - prod5 + prod7
-    out12 = prod3 + prod5
-    out21 = prod2 + prod4
-    out22 = prod1 - prod2 + prod3 + prod6
-
-    top = fnp.concatenate([out11, out12], axis=1)
-    bottom = fnp.concatenate([out21, out22], axis=1)
-    return fnp.concatenate([top, bottom], axis=0)
-
-
-def _bmean(x2):
-    """Mean over rows of a 2-block sample matrix (blocks are equal halves)."""
-    return (fnp.mean(x2[0], axis=0) + fnp.mean(x2[1], axis=0)) * fnp.float32(0.5)
-
-
-def _dense_matmul_2blk(x2, weights):
-    """Dense matmul on a row-blocked (top, bottom) pair, returned UNASSEMBLED.
-
-    The pipeline block boundary (antithetic half) IS the one-level Strassen
-    row split, so the quadrant products are byte-for-byte the ones the
-    unblocked `_strassen_even_matmul` computes — but the axis=0 output
-    assembly concat (the largest single grader-priced copy in the census,
-    1.15 GB/net) never happens. Guards replicate `_dense_matmul` on the
-    COMBINED row count; n is always even here (antithetic pairs), so the
-    odd-row bottom branch cannot fire.
-    """
-    xt, xb = x2
-    row_count = xt.shape[0] + xb.shape[0]
-    in_width = weights.shape[0]
-    out_width = weights.shape[1]
-    if (
-        not _DENSE_STRASSEN
-        or row_count < _DENSE_STRASSEN_MIN_ROWS
-        or in_width < _DENSE_STRASSEN_MIN_IN
-        or out_width < _DENSE_STRASSEN_MIN_OUT
-    ):
-        return xt @ weights, xb @ weights
-    core_in = in_width - (in_width % 2)
-    core_out = out_width - (out_width % 2)
-    if core_in < _DENSE_STRASSEN_MIN_IN or core_out < _DENSE_STRASSEN_MIN_OUT:
-        return xt @ weights, xb @ weights
-
-    half_in = core_in // 2
-    half_out = core_out // 2
-    x11 = xt[:, :half_in]
-    x12 = xt[:, half_in:core_in]
-    x21 = xb[:, :half_in]
-    x22 = xb[:, half_in:core_in]
-    w11 = weights[:half_in, :half_out]
-    w12 = weights[:half_in, half_out:core_out]
-    w21 = weights[half_in:core_in, :half_out]
-    w22 = weights[half_in:core_in, half_out:core_out]
-
-    recurse = (
-        (row_count // 4) >= _DENSE_STRASSEN_MIN_ROWS
-        and half_in >= _DENSE_STRASSEN_MIN_IN
-        and half_out >= _DENSE_STRASSEN_MIN_OUT
-        and (row_count // 2) % 2 == 0
-        and half_in % 2 == 0
-        and half_out % 2 == 0
-    )
-
-    def _prod(a, b):
-        if recurse:
-            return _strassen_even_matmul(a, b)
-        return a @ b
-
-    prod1 = _prod(x11 + x22, w11 + w22)
-    prod2 = _prod(x21 + x22, w11)
-    prod3 = _prod(x11, w12 - w22)
-    prod4 = _prod(x22, w21 - w11)
-    prod5 = _prod(x11 + x12, w22)
-    prod6 = _prod(x21 - x11, w11 + w12)
-    prod7 = _prod(x12 - x22, w21 + w22)
-
-    out11 = prod1 + prod4 - prod5 + prod7
-    out12 = prod3 + prod5
-    out21 = prod2 + prod4
-    out22 = prod1 - prod2 + prod3 + prod6
-
-    top = fnp.concatenate([out11, out12], axis=1)
-    bottom = fnp.concatenate([out21, out22], axis=1)
-
-    if core_in < in_width:
-        top = top + (xt[:, core_in:] @ weights[core_in:, :core_out])
-        bottom = bottom + (xb[:, core_in:] @ weights[core_in:, :core_out])
-    if core_out < out_width:
-        top = fnp.concatenate([top, xt @ weights[:, core_out:]], axis=1)
-        bottom = fnp.concatenate([bottom, xb @ weights[:, core_out:]], axis=1)
-    return top, bottom
-
-
-def _dense_matmul(x, weights):
-    row_count = x.shape[0]
-    in_width = weights.shape[0]
-    out_width = weights.shape[1]
-    if (
-        not _DENSE_STRASSEN
-        or row_count < _DENSE_STRASSEN_MIN_ROWS
-        or in_width < _DENSE_STRASSEN_MIN_IN
-        or out_width < _DENSE_STRASSEN_MIN_OUT
-    ):
-        return x @ weights
-
-    core_rows = row_count - (row_count % 2)
-    core_in = in_width - (in_width % 2)
-    core_out = out_width - (out_width % 2)
-    if core_rows < _DENSE_STRASSEN_MIN_ROWS or core_in < _DENSE_STRASSEN_MIN_IN or core_out < _DENSE_STRASSEN_MIN_OUT:
-        return x @ weights
-
-    result_core = _strassen_even_matmul(x[:core_rows, :core_in], weights[:core_in, :core_out])
-    if core_in < in_width:
-        result_core = result_core + (x[:core_rows, core_in:] @ weights[core_in:, :core_out])
-
-    if core_out < out_width:
-        right_cols = x[:core_rows, :] @ weights[:, core_out:]
-        result = fnp.concatenate([result_core, right_cols], axis=1)
-    else:
-        result = result_core
-
-    if core_rows < row_count:
-        bottom_rows = x[core_rows:, :] @ weights
-        return fnp.concatenate([result, bottom_rows], axis=0)
-    return result
-
-
 def _packed_matmul(x, weights):
     n_rows = x.shape[0]
     prev_width = weights.shape[0]
     out_width = weights.shape[1]
-    out = fnp.zeros((n_rows, out_width), dtype=fnp.float32)
 
+    # One host sync per call (not per chunk): a global k >= every row's nnz keeps
+    # the packed contraction exact while eliminating the per-chunk max/branch
+    # syncs that dominated residual wall-time.
+    max_nnz = int(fnp.max(fnp.sum(x > fnp.float32(0.0), axis=1)))
+    if max_nnz == 0:
+        return fnp.zeros((n_rows, out_width), dtype=fnp.float32)
+
+    k = _ceil_bucket(max_nnz, _PACKED_ROWSPARSE_BUCKET, prev_width)
+    if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
+        return x @ weights
+
+    # Chunk only to bound the (chunk_rows, k, out_width) gather footprint; the
+    # loop body is pure flopscope array ops, no host readback.
+    chunks = []
     for start in range(0, n_rows, _PACKED_ROWSPARSE_CHUNK_ROWS):
         stop = min(n_rows, start + _PACKED_ROWSPARSE_CHUNK_ROWS)
         x_chunk = x[start:stop, :]
-        chunk_rows = stop - start
-        mask_chunk = x_chunk > fnp.float32(0.0)
-        mask_chunk = mask_chunk.astype(fnp.float32)
+        order = fnp.argpartition(x_chunk == fnp.float32(0.0), k - 1, axis=1)[:, :k]
+        values = fnp.take_along_axis(x_chunk, order, axis=1)
+        gathered_weights = fnp.take(weights, order, axis=0)
+        chunks.append(fnp.einsum("nk,nko->no", values, gathered_weights))
 
-        nnz_per_row = fnp.sum(mask_chunk, axis=1)
-        max_nnz = int(fnp.max(nnz_per_row))
-        if max_nnz == 0:
-            continue
-
-        row_order = fnp.argsort(nnz_per_row)
-        x_sorted = fnp.take(x_chunk, row_order, axis=0)
-        mask_sorted = x_sorted > fnp.float32(0.0)
-        sorted_nnz = fnp.take(nnz_per_row, row_order, axis=0)
-        chunk_groups = []
-        group_start = 0
-        for limit in _PACKED_ROWSPARSE_ROW_BUCKETS:
-            if limit > prev_width:
-                continue
-            group_stop = int(fnp.searchsorted(sorted_nnz, limit, side="right"))
-            if group_stop <= group_start:
-                continue
-
-            x_group = x_sorted[group_start:group_stop, :]
-            group_rows = group_stop - group_start
-            if limit == 0:
-                chunk_groups.append(fnp.zeros((group_rows, out_width), dtype=fnp.float32))
-            else:
-                k = _ceil_bucket(limit, _PACKED_ROWSPARSE_BUCKET, prev_width)
-                if k * _PACKED_ROWSPARSE_MAX_K_DEN > prev_width * _PACKED_ROWSPARSE_MAX_K_NUM:
-                    chunk_groups.append(_dense_matmul(x_group, weights))
-                else:
-                    mask_group = mask_sorted[group_start:group_stop, :]
-                    order = fnp.argpartition(mask_group, prev_width - k, axis=1)[:, -k:]
-                    values = fnp.take_along_axis(x_group, order, axis=1)
-                    gathered_weights = fnp.take(weights, order, axis=0)
-                    chunk_groups.append(fnp.einsum("nk,nko->no", values, gathered_weights))
-
-            group_start = group_stop
-            if group_start == chunk_rows:
-                break
-
-        if group_start < chunk_rows:
-            chunk_groups.append(_dense_matmul(x_sorted[group_start:chunk_rows, :], weights))
-
-        chunk_sorted = chunk_groups[0] if len(chunk_groups) == 1 else fnp.concatenate(chunk_groups, axis=0)
-        indices = fnp.reshape(row_order + start, (chunk_rows, 1))
-        indices = fnp.broadcast_to(indices, (chunk_rows, out_width))
-        fnp.put_along_axis(out, indices, chunk_sorted, axis=0)
-
-    return out
+    if len(chunks) == 1:
+        return chunks[0]
+    return fnp.concatenate(chunks, axis=0)
 
 
-def _split_matmul_with_fire_2blk(x2, weights, fire_rate, positive_bias):
-    """Row-blocked split matmul: the column split (from the analytic fire
-    rate) is shared by both blocks; the dense part runs through the
-    unassembled 2-block Strassen; the packed part runs per block (rows are
-    independent). Returns (top, bottom)."""
-    N = len(fire_rate)
-    k = int(fnp.ceil(N * positive_bias))
-    if k >= N:
-        k = N - 1
-    fire_sort_idx = fnp.argsort(fire_rate)[::-1]
-    dense_pos = fire_sort_idx[:k]
-    sparse_pos = fire_sort_idx[k:]
-
-    if len(dense_pos) < _BLOCK_SPLIT_MIN_DENSE_COLS or len(sparse_pos) < _BLOCK_SPLIT_MIN_SPARSE_COLS:
-        return (
-            _packed_matmul(x2[0], weights),
-            _packed_matmul(x2[1], weights),
-        )
-
-    w_dense = fnp.take(weights, dense_pos, axis=0)
-    w_sparse = fnp.take(weights, sparse_pos, axis=0)
-    dense_t, dense_b = _dense_matmul_2blk(
-        (fnp.take(x2[0], dense_pos, axis=1), fnp.take(x2[1], dense_pos, axis=1)), w_dense
-    )
-    packed_t = _packed_matmul(
-        fnp.take(x2[0], sparse_pos, axis=1), w_sparse
-    )
-    packed_b = _packed_matmul(
-        fnp.take(x2[1], sparse_pos, axis=1), w_sparse
-    )
-    return dense_t + packed_t, dense_b + packed_b
+def _packed_relu_matmul(x, weights):
+    return fnp.maximum(_packed_matmul(x, weights), 0.0)
 
 
-def _block_split_matmul_2blk(x2, weights, layer_idx: int, fire_rate, positive_bias, masks2=None):
-    if masks2 is None:
-        masks2 = (x2[0] > fnp.float32(0.0), x2[1] > fnp.float32(0.0))
-    if layer_idx == _PACKED_ROWSPARSE_START_LAYER:
-        return (
-            _packed_matmul(x2[0], weights),
-            _packed_matmul(x2[1], weights),
-        )
-    return _split_matmul_with_fire_2blk(x2, weights, fire_rate, positive_bias)
+_USE_STRASSEN = True
+_STRASSEN_MIN_DIM = 96
 
 
-def _block_split_relu_matmul_2blk(x2, weights, layer_idx: int, fire_rate, positive_bias, masks2=None):
-    top, bottom = _block_split_matmul_2blk(x2, weights, layer_idx, fire_rate, positive_bias, masks2)
-    mask_top = top > fnp.float32(0.0)
-    mask_bot = bottom > fnp.float32(0.0)
-    x_out = (fnp.where(mask_top, top, fnp.float32(0.0)), fnp.where(mask_bot, bottom, fnp.float32(0.0)))
-    return x_out, (mask_top, mask_bot)
+def _strassen_matmul(x, w):
+    """Exact one-level Strassen matmul using only flopscope-native ops.
+
+    Splits all three dims; odd dims are zero-padded (exact and FLOP-free). Falls
+    back to a plain contraction when the shared/output dims are too small for the
+    7-product decomposition to beat the standard 8-product cost.
+    """
+    m, k = x.shape
+    _, n = w.shape
+    if k < _STRASSEN_MIN_DIM or n < _STRASSEN_MIN_DIM:
+        return x @ w
+
+    if k % 2:
+        x = fnp.concatenate([x, fnp.zeros((m, 1), dtype=x.dtype)], axis=1)
+        w = fnp.concatenate([w, fnp.zeros((1, n), dtype=w.dtype)], axis=0)
+        k += 1
+    pad_m = m % 2
+    if pad_m:
+        x = fnp.concatenate([x, fnp.zeros((1, k), dtype=x.dtype)], axis=0)
+    pad_n = n % 2
+    if pad_n:
+        w = fnp.concatenate([w, fnp.zeros((k, 1), dtype=w.dtype)], axis=1)
+
+    mm, nn = m + pad_m, n + pad_n
+    mh, kh, nh = mm // 2, k // 2, nn // 2
+    A11, A12 = x[:mh, :kh], x[:mh, kh:]
+    A21, A22 = x[mh:, :kh], x[mh:, kh:]
+    B11, B12 = w[:kh, :nh], w[:kh, nh:]
+    B21, B22 = w[kh:, :nh], w[kh:, nh:]
+
+    M1 = (A11 + A22) @ (B11 + B22)
+    M2 = (A21 + A22) @ B11
+    M3 = A11 @ (B12 - B22)
+    M4 = A22 @ (B21 - B11)
+    M5 = (A11 + A12) @ B22
+    M6 = (A21 - A11) @ (B11 + B12)
+    M7 = (A12 - A22) @ (B21 + B22)
+
+    C11 = M1 + M4 - M5 + M7
+    C12 = M3 + M5
+    C21 = M2 + M4
+    C22 = M1 - M2 + M3 + M6
+    top = fnp.concatenate([C11, C12], axis=1)
+    bot = fnp.concatenate([C21, C22], axis=1)
+    out = fnp.concatenate([top, bot], axis=0)
+    return out[:m, :n]
+
+
+def _dense_matmul(x, w):
+    if _USE_STRASSEN:
+        return _strassen_matmul(x, w)
+    return x @ w
 
 
 class Estimator(BaseEstimator):
@@ -482,8 +231,6 @@ class Estimator(BaseEstimator):
         dead_corrections = []
         analytical_rows = []
         alpha_rows = []
-        phi_rows = []
-        positive_bias_rows = []
         mu_post = fnp.zeros(width)
         var_post = fnp.zeros(width)
 
@@ -512,8 +259,6 @@ class Estimator(BaseEstimator):
 
             phi = flops.stats.norm.pdf(alpha)
             Phi = flops.stats.norm.cdf(alpha)
-            phi_rows.append(Phi)
-            positive_bias_rows.append(float(fnp.mean(Phi)))
             mu_post = mu_pre * Phi + sigma_pre * phi
             var_post = (var_pre + mu_pre * mu_pre) * Phi + mu_pre * sigma_pre * phi - mu_post * mu_post
             var_post = fnp.maximum(var_post, 1e-12)
@@ -532,8 +277,6 @@ class Estimator(BaseEstimator):
             "dead_corrections": dead_corrections,
             "analytical_rows": analytical_rows,
             "alpha_rows": alpha_rows,
-            "phi_rows": phi_rows,
-            "positive_bias_rows": positive_bias_rows,
             "final_var_mean": float(fnp.mean(var_post)),
         }
 
@@ -546,9 +289,9 @@ class Estimator(BaseEstimator):
                 f"but this estimator needs {end_half}."
             )
         half = fnp.array(self._sobol_points[start_half:end_half, :width])
-        return half, -half
+        return fnp.concatenate([half, -half], axis=0)
 
-    def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, dict]:
+    def _run_block(self, mlp: MLP, structure: dict, x, n_samples: int, refine: bool) -> tuple[list, float, dict]:
         width = mlp.width
         active_indices = list(structure["active_indices"])
         kink_indices = list(structure["kink_indices"])
@@ -557,13 +300,10 @@ class Estimator(BaseEstimator):
         dead_corrections = list(structure["dead_corrections"])
         analytical_rows = structure["analytical_rows"]
         alpha_rows = structure["alpha_rows"]
-        phi_rows = structure["phi_rows"]
-        positive_bias_rows = structure["positive_bias_rows"]
 
         mc_rows = []
         prev_idx = None
         x_before_fold = None
-        x_masks = None
 
         for layer_idx, w in enumerate(mlp.weights):
             idx = active_indices[layer_idx]
@@ -572,10 +312,9 @@ class Estimator(BaseEstimator):
 
             if len(idx) == 0:
                 mc_rows.append(fnp.zeros(width))
-                x = (fnp.zeros((n_samples // 2, 0)), fnp.zeros((n_samples // 2, 0)))
+                x = fnp.zeros((n_samples, 0))
                 prev_idx = idx
                 x_before_fold = None
-                x_masks = None
                 continue
 
             if (
@@ -653,19 +392,16 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                fire_rate = phi_rows[layer_idx - 1][prev_idx]
-                pb = positive_bias_rows[layer_idx - 1]
-                x_kink, x_kink_masks = _block_split_relu_matmul_2blk(x, w_kink, layer_idx, fire_rate, pb, x_masks)
-                kink_mean = _bmean(x_kink)
+                x_kink = fnp.maximum(x @ w_kink, 0.0)
+                kink_mean = fnp.mean(x_kink, axis=0)
 
-                mean_prev = _bmean(x)
+                mean_prev = fnp.mean(x, axis=0)
                 w_on = w[prev_idx, :][:, on_idx]
                 on_mean = mean_prev @ w_on
 
                 mc_rows.append(_scatter(kink_mean, kink_idx, width) + _scatter(on_mean, on_idx, width))
 
                 x = x_kink
-                x_masks = x_kink_masks
                 prev_idx = kink_idx
                 continue
 
@@ -674,21 +410,16 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                fire_rate = phi_rows[layer_idx - 1][prev_idx]
-                pb = positive_bias_rows[layer_idx - 1]
-                pre_from_kink = _block_split_matmul_2blk(x, w_from_kink, layer_idx, fire_rate, pb, x_masks)
+                pre_from_kink = x @ w_from_kink
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
                 w_this_from_on = w[fold_on_idx, :][:, kink_idx]
                 w_folded = w_fold_on @ w_this_from_on
-                pre_from_on = _dense_matmul_2blk(x_before_fold, w_folded)
+                pre_from_on = x_before_fold @ w_folded
 
-                x_kink = (
-                    fnp.maximum(pre_from_kink[0] + pre_from_on[0], 0.0),
-                    fnp.maximum(pre_from_kink[1] + pre_from_on[1], 0.0),
-                )
-                kink_mean = _bmean(x_kink)
+                x_kink = fnp.maximum(pre_from_kink + pre_from_on, 0.0)
+                kink_mean = fnp.mean(x_kink, axis=0)
 
                 prev_layer_mean = mc_rows[30]
                 fold_active_idx = active_indices[30]
@@ -734,38 +465,20 @@ class Estimator(BaseEstimator):
             if prev_idx is None:
                 w_active = w[:, idx]
                 half_rows = n_samples // 2
-                pre_half = _dense_matmul(x[0][:half_rows, :], w_active)
-                mask_pos = pre_half > fnp.float32(0.0)
-                neg_half = -pre_half
-                mask_neg = neg_half > fnp.float32(0.0)
-                x = (fnp.where(mask_pos, pre_half, fnp.float32(0.0)), fnp.where(mask_neg, neg_half, fnp.float32(0.0)))
-                x_masks = (mask_pos, mask_neg)
+                pre_half = _dense_matmul(x[:half_rows, :], w_active)
+                x = fnp.concatenate([fnp.maximum(pre_half, 0.0), fnp.maximum(-pre_half, 0.0)], axis=0)
             else:
                 w_active = w[prev_idx, :][:, idx]
-                fire_rate = phi_rows[layer_idx - 1][prev_idx]
-                pb = positive_bias_rows[layer_idx - 1]
                 if (
                     _PACKED_ROWSPARSE
                     and (refine or _PACKED_ROWSPARSE_EXTRA_BLOCKS)
                     and _PACKED_ROWSPARSE_START_LAYER <= layer_idx <= _PACKED_ROWSPARSE_STOP_LAYER
                 ):
-                    if _BLOCK_SPLIT_ROWSPARSE:
-                        x, x_masks = _block_split_relu_matmul_2blk(x, w_active, layer_idx, fire_rate, pb, x_masks)
-                    else:
-                        top = _packed_matmul(x[0], w_active)
-                        bot = _packed_matmul(x[1], w_active)
-                        mask_top = top > fnp.float32(0.0)
-                        mask_bot = bot > fnp.float32(0.0)
-                        x = (fnp.where(mask_top, top, fnp.float32(0.0)), fnp.where(mask_bot, bot, fnp.float32(0.0)))
-                        x_masks = (mask_top, mask_bot)
+                    x = _packed_relu_matmul(x, w_active)
                 else:
-                    dt, db = _dense_matmul_2blk(x, w_active)
-                    mask_dt = dt > fnp.float32(0.0)
-                    mask_db = db > fnp.float32(0.0)
-                    x = (fnp.where(mask_dt, dt, fnp.float32(0.0)), fnp.where(mask_db, db, fnp.float32(0.0)))
-                    x_masks = (mask_dt, mask_db)
+                    x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
             if _MATERIALIZE_INTERMEDIATE_ROWS or layer_idx >= 30:
-                mc_rows.append(_scatter(_bmean(x), idx, width))
+                mc_rows.append(_scatter(fnp.mean(x, axis=0), idx, width))
             else:
                 mc_rows.append(fnp.zeros(width))
             prev_idx = idx
@@ -788,26 +501,27 @@ class Estimator(BaseEstimator):
             "dead_corrections": dead_corrections,
             "analytical_rows": analytical_rows,
             "alpha_rows": alpha_rows,
-            "phi_rows": phi_rows,
-            "positive_bias_rows": positive_bias_rows,
         }
-        return rows, refined_structure
+        return rows, 0.0, refined_structure
 
     def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
+        _ = budget
         width = mlp.width
         structure = self._initial_structure(mlp, width)
+        target_samples = _choose_samples(structure["final_var_mean"])
         base_x = self._sample_block(0, _BASE_SAMPLES // 2, width)
-        base_rows, refined_structure = self._run_block(
+        base_rows, final_anal_diff_mean, refined_structure = self._run_block(
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
-        extra_samples = _TOTAL_SAMPLES - _BASE_SAMPLES
+        _ = final_anal_diff_mean
+        if target_samples <= _BASE_SAMPLES:
+            return fnp.stack(base_rows, axis=0)
+
+        extra_samples = target_samples - _BASE_SAMPLES
         extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
-        extra_rows = self._run_block(
-            mlp, refined_structure, extra_x, extra_samples, refine=False
-        )[0]
+        extra_rows, _, _ = self._run_block(mlp, refined_structure, extra_x, extra_samples, refine=False)
         combined_rows = [
-            base_row * _BASE_SAMPLES + extra_row * extra_samples
+            (base_row * _BASE_SAMPLES + extra_row * extra_samples) / target_samples
             for base_row, extra_row in zip(base_rows, extra_rows)
         ]
-        combined_rows = [row / _TOTAL_SAMPLES for row in combined_rows]
         return fnp.stack(combined_rows, axis=0)

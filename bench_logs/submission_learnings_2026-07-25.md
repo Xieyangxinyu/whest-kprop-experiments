@@ -168,3 +168,77 @@
   ~17% more of the same), (b) unassembled 2-block Strassen output (skip the
   axis=0 assembly concats 318752 pays), (c) demotion knee -2.33 as a separate
   probe.
+
+## Demotion knee on top of 318803 (algo43 surface, 10 nets)
+
+- knee (probe<=-1.5, demote<=-2.33) on algo43: F -4.9%, raw +1.3%, adj -3.2%
+  (was -6.0% on the plain dense surface: SUB-ADDITIVE with cold-slicing —
+  both levers feed on the same rarely-firing columns; cold-slice already
+  harvests them at zero raw cost and strictly dominates demotion alone).
+- FRAGILE: the neighbor threshold -2.45 shows raw +3.3% (worse than -2.33's
+  +1.3%) — near-threshold demotion is realization-noisy; hidden-suite raw
+  penalty uncertain in ~[+1%, +3.5%]. Per the transfer rule (raw-neutral
+  cuts transfer, multiplier-led trades don't), grader sign is uncertain.
+- Decision: do NOT ship the bare knee. Better variant identified:
+  "demote + mean-compensate" — add demoted columns' analytic mean
+  contribution to the next layer's pre as a constant row (mu_post[D] @
+  w[D, idx], broadcast add ~1/elem) to cancel first-order bias while
+  keeping the FLOP cut. Build/test before spending a submission.
+
+## Ladder / recursive cold-slicing: explored and CLOSED (offline DP on real masks)
+
+- Widen-then-ladder (kmax at fire<10%, optimal 2-4 cuts, DP): NEGATIVE
+  everywhere (-2.1..-3.6% of layer vs shipped even at the optimum). Columns
+  firing 3-10% are row-incoherent (most rows have support near the band top),
+  so covering cuts collapse to kmax. Corollary: the shipped 3% fire threshold
+  is near the theoretical optimum for contiguous-prefix schemes.
+- Recursion INSIDE the shipped cold set (optimal cuts): L=2 saves 0.33% of
+  layer, L=3 0.47% -> ~0.25-0.35% total F BEFORE per-level overheads; net
+  ~0.2%. Rightmost-support positions are ~uniform across the cold set, so
+  quantization gains are tiny. Not worth the syncs/complexity.
+- Remaining top-left-block harvest: micro-pack the 1-3-nnz support rows
+  (gather-einsum in miniature, ~2% total F) — complexity-priced, optional.
+- Preferred next bundle: pilot-block cold-slicing (~0.8%, same primitive) +
+  mean-compensated demotion (if raw-neutral) [+ optional micro-pack].
+
+## CORRECTION: recursion != ladder — independent column groups are 5x better
+
+- The prefix-ladder DP (previous entry) forced every paying row to pay from
+  column 0; TRUE recursion partitions the cold columns into INDEPENDENT
+  groups, each with its own row partition: cost = sum_g n_g*w_g. A row with
+  support only in the warm-cold group skips the ultra-cold group entirely.
+- Optimal contiguous groups on the 9 cached masks (ideal): G2 -1.64%, G3
+  -2.15%, G4 -2.42% of layer (floor = per-column singletons at -3.1%).
+- Overhead-honest (each extra group pays a full-height n*out accumulate add
+  + n_g*out back-scatter + slab scatter + 1 sync): G2 ~-1.29%, G3 ~-1.55%,
+  G4 ~-1.57% of layer -> ~0.97% / 1.17% / 1.17% of total billed F.
+- VERDICT: one recursion (G=2) is worth ~1% total F at zero raw cost; G=3
+  adds ~0.2pp; plateau after. Accumulation adds are the binding overhead —
+  any implementation should ride the existing top-slice add for group 1 and
+  pay the full-height add only for group 2+.
+- Bundle candidate: G2-3 recursion (~1%) + pilot-block cold-slicing (~0.8%)
+  [+ mean-compensated demotion if raw-neutral] => ~2% on top of 318803.
+
+### Submission 318873 - algo44-coldslice-r2p (Algorithm 44)
+
+- Result: pending
+- Surface: 318803 + (1) two-level cold recursion in the continuation: rows
+  scatter-ordered once by support PATTERN over an ultra-cold (<1% pilot
+  fire) / warm-cold split — all four groups and their column slabs
+  contiguous, corrections land as slice-adds (matches the DP-ideal G2 cost);
+  (2) pilot-block cold-slicing: columns ordered by analytic alpha
+  (< -1.88 ~ Phi 3%), single-level carve, row order RESTORED per layer via
+  inverse-permutation scatter so Sobol-prefix probe rows and antithetic
+  pairing are untouched (34c lesson).
+- Local 10-net A/B vs algo43: F 145.2 -> 142.4G (-1.94%), raw +0.01%
+  (max pred delta 3.5e-6, fp-reorder class), adjusted 2.0012 -> 1.9632e-7
+  (-1.90%). whest run 5 nets: 0 failures, mult 0.681. No raw numpy.
+- Result: GRADED — small improvement over 318803 (new best; exact score
+  read manually from the leaderboard). Consistent with the local -1.9%
+  prediction, possibly shaved by the added sync/scatter residual (~+112
+  host syncs/net vs algo43).
+- Lesson: the exact-rerouting axis is entering diminishing returns — each
+  remaining FLOP lever (~1-2% billed) now moves the score by ~3e-9-class
+  amounts. The largest single known lever left is mean-compensated
+  demotion (-4.9% F IF the compensation holds raw-neutral); after that,
+  score movement has to come from the accuracy side.

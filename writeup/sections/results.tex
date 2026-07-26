@@ -1,6 +1,6 @@
 \section{Results, Limitations, and Future Work}
 
-\subsection{Where the final-layer error lives}
+\subsection{The Scored Error Concentrates in a Few Large Always-On Neurons}
 
 \begin{figure}[t]
     \centering
@@ -16,15 +16,15 @@
     \label{fig:error-concentration}
 \end{figure}
 
-All measurements in this section use the submitted estimator ($N = 61{,}440$ Sobol samples) on 50 of the 100 public mini networks (even ids 0--98); for distribution-level measurements we take four of these (ids 0, 32, 66, 98) and draw 16{,}384 antithetic samples each.\footnote{All figures and statistics are produced by \texttt{estimator\_error\_attribution\_algo34.ipynb} in the repository.} Since only final-layer error is scored, we restrict attention to the final layer, where the median MSE is $2.9\times10^{-7}$ (mean $4.3\times10^{-7}$).
+All measurements in this section use an earlier version of the submitted estimator (Algorithm 34; same $N = 61{,}440$ Sobol samples) on 50 of the 100 public mini networks (even ids 0--98). The submitted version differs from it only in how the same sampled matrix products are computed---cold-column slicing, Strassen order, and a float32 cast---so the error statistics carry over. For distribution-level measurements we take four of these networks (ids 0, 32, 66, 98) and draw 16{,}384 antithetic samples each.\footnote{All figures and statistics are produced by \texttt{estimator\_error\_attribution\_algo34.ipynb} in the repository.} Since only final-layer error is scored, we restrict attention to the final layer, where the median MSE is $2.9\times10^{-7}$ (mean $4.3\times10^{-7}$).
 
 When we analyze the final-layer squared error by neuron class (\Cref{fig:error-by-class}), always-on neurons turn out to carry nearly all of it---78.0\% of the total, against 21.4\% for kink neurons and just 0.5\% for dead ones. This is not because on neurons are more numerous but because they are bigger: their outputs average $\approx 1.5$ in magnitude versus $\approx 0.17$ for kink neurons, so even modest relative errors on the on block dominate everything else. The concentration continues within the on block itself (\Cref{fig:error-concentration}), where the top 10\% of neurons by output magnitude account for 46\% of the squared error and the top 20\% for 66\%.
 
-\subsection{Direction and driver of the on-neuron error}
+\subsection{The On-Neuron Error Is Sampling Variance, Not Bias}
 
-Is the on-block error bias or just noise? Pooled over the 50 networks, the mean signed error is $-2.1\times10^{-6}$---more than two orders of magnitude below the error spread of $1.1\times10^{-3}$---so it has no meangingful direction. There is a slight lean toward under-estimation (52.3\% of on neurons land below the truth, as do 29 of the 50 networks), but this is a median effect rather than a bias: frequent small undershoots are balanced by rarer, larger overshoots, so more than half of realizations land low. Because all 256 outputs share the same sample points, each network additionally picks up a common shift, which is why whole networks (not just neurons) lean one way. Further analysis also indciates that the size of the error also matches what sampling variance predicts. 
+Is the on-block error bias or just noise? Pooled over the 50 networks, the mean signed error is $-2.1\times10^{-6}$---more than two orders of magnitude below the error spread of $1.1\times10^{-3}$---so it has no meaningful direction. There is a slight lean toward under-estimation (52.3\% of on neurons land below the truth, as do 29 of the 50 networks), but this is a median effect rather than a bias: frequent small undershoots are balanced by rarer, larger overshoots, so more than half of realizations land low. Because all 256 outputs share the same sample points, each network additionally picks up a common shift, which is why whole networks (not just neurons) lean one way. Further analysis also indicates that the size of the error matches what sampling variance predicts.
 
-\subsection{Limitations and future work}
+\subsection{Limitations and Future Work: Heavy Tails and Jointly-Crossing Kinks}
 
 \begin{figure}[t]
     \centering
@@ -48,4 +48,3 @@ Is the on-block error bias or just noise? Pooled over the 50 networks, the mean 
 Prior work shows that on-neuron activations become increasingly heavy-tailed with depth, following sub-Weibull distributions \citep{vladimirova2019understanding}. We see this directly, if modestly at this width: both skewness and excess kurtosis grow with depth (\Cref{fig:heavy-tails}). These heavy tails expose a limitation of the diagonal Gaussian propagation pass. In deeper layers, it overestimates on-neuron means ($+1.5\%$ in late layers, $+1.8\%$ at the final layer), while its Gaussian tail underestimates the clipping probability by roughly a factor of two. The submitted estimator largely eliminates this error: kink neurons are sampled, on neurons are eventually treated linearly, and the analytical pass survives only in classification and the dead-neuron correction. How to propagate heavy-tailed distributions well remains an open question.
 
 For kink neurons, a natural next step is to parametrize their joint distribution more carefully, for instance with multivariate probit models \citep{cragg1971some, chib2001metropolis}. There is a clear signal to exploit here: kink pre-activations are substantially cross-correlated, and the coupling grows with depth (\Cref{fig:kink-correlation}). Near-threshold neurons tend to cross the kink together---a joint event that independent-marginal propagation cannot represent.
-3

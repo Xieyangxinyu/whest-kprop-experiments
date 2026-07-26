@@ -575,3 +575,29 @@ same artifact bytes (= same scramble, re-rolled point/net alignment).
   and 318873 as tied.
 - Lesson: the grader's own repeat variance (~0.5%) is the resolution floor;
   leaderboard deltas below it carry no information about the bytes.
+
+## 07-26 early: micro-savings bundle measured SUB-NOISE; exact-rerouting axis closed with numbers
+
+Probes (scripts/unassembled_strassen_probe.py + a nested-tag axis split) on the
+shipped 319031 bytes, mini nets 0-50 step 10, flopscope 0.9.1:
+
+- baseline F = 143.10G (F-only mult 0.5261); billing 96.8% matmul.
+- concatenate total 1.61G (1.12%): strassen 0.86%, carve 0.24%, pilot 0.10%.
+- VERTICAL (skippable) concats split by nesting: inside-carve 0.193% +
+  carve parts-reassembly 0.192% + pilot 0.09% + composable-outside-carve
+  0.086%. Horizontal unassembly is exactly a wash (skipped concat = added
+  add in the next matmul).
+- Row-block Strassen unassembly therefore nets 0.086% clean (carve group
+  boundaries are data-dependent and force reassembly inside carved layers);
+  maximal carve-rewrite ceiling ~0.56%. All below the 0.5% re-grade noise
+  floor (319031 vs 318978), with the 3-level-Strassen small-op wall risk
+  on top. DO NOT IMPLEMENT.
+- Pilot-carve toggle audit: the shipped pilot carve SAVES 0.905% billed.
+- Grader mult (0.558-0.561) minus local F-only (0.526) bounds wall +
+  hidden-suite billing variation at ~9G combined; wall tuning has no
+  separable payoff.
+- Knob inventory check: promoted bytes already contain the factorial
+  winners (PILOT_FRACTION 0.025, COLD_FIRE 0.05 = 318964 tuned base +
+  fold-Strassen). _PILOT_ALPHA_COLD -1.88 targets Phi~0.03 vs census 0.05
+  (worth ~0.02-0.05%, sub-noise; left as shipped). Remaining path to
+  <1.66e-7: re-grade draws only (~1/3 per slot).

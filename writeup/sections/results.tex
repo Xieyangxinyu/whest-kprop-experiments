@@ -5,24 +5,24 @@
 \begin{figure}[t]
     \centering
     \includegraphics[width=\linewidth]{figures/final_layer_error_by_class.png}
-    \caption{Final-layer error by neuron class (50 public mini networks). Always-on neurons carry 78.0\% of the total squared error, kink neurons 21.4\%, dead neurons 0.5\%.}
+    \caption{Final-layer error by neuron class (50 public mini networks). Always-on neurons carry 74.4\% of the total squared error, kink neurons 24.8\%, dead neurons 0.8\%.}
     \label{fig:error-by-class}
 \end{figure}
 
 \begin{figure}[t]
     \centering
     \includegraphics[width=0.62\linewidth]{figures/final_layer_error_concentration.png}
-    \caption{Cumulative final-layer squared error by output-magnitude rank (same 50 networks): the top 10\% of neurons carry 46\% of the squared error, the top 20\% carry 66\%.}
+    \caption{Cumulative final-layer squared error by output-magnitude rank (same 50 networks): the top 10\% of neurons carry 38\% of the squared error, the top 20\% carry 61\%.}
     \label{fig:error-concentration}
 \end{figure}
 
-All measurements in this section use the submitted estimator (submission \submissionid, $N = 61{,}440$ Sobol samples) on 50 of the 100 public mini networks (even ids 0--98). For distribution-level measurements we take four of these networks (ids 0, 32, 66, 98) and draw 16{,}384 antithetic samples each.\footnote{All statistics are produced by \texttt{estimator\_error\_attribution\_319266.ipynb} in the repository; the figures are rendered by \texttt{writeup/figures.ipynb} from the same cached predictions.} Since only final-layer error is scored, we restrict attention to the final layer, where the median MSE is $2.9\times10^{-7}$ (mean $4.3\times10^{-7}$).
+All measurements in this section use the submitted estimator (submission \submissionid, $N = 84{,}992$ Sobol samples) on 50 of the 100 public mini networks (even ids 0--98). For distribution-level measurements we take four of these networks (ids 0, 32, 66, 98) and draw 16{,}384 antithetic samples each.\footnote{All statistics are produced by \texttt{estimator\_error\_attribution\_319341.ipynb} in the repository; the figures are rendered by \texttt{writeup/figures.ipynb} from the same cached predictions.} Since only final-layer error is scored, we restrict attention to the final layer, where the median MSE is $2.3\times10^{-7}$ (mean $2.9\times10^{-7}$).
 
-When we analyze the final-layer squared error by neuron class (\Cref{fig:error-by-class}), always-on neurons turn out to carry nearly all of it---78.0\% of the total, against 21.4\% for kink neurons and just 0.5\% for dead ones. This is not because on neurons are more numerous but because they are bigger: their outputs average $\approx 1.5$ in magnitude versus $\approx 0.17$ for kink neurons, so even modest relative errors on the on block dominate everything else. The concentration continues within the on block itself (\Cref{fig:error-concentration}), where the top 10\% of neurons by output magnitude account for 46\% of the squared error and the top 20\% for 66\%.
+When we analyze the final-layer squared error by neuron class (\Cref{fig:error-by-class}), always-on neurons turn out to carry most of it---74.4\% of the total, against 24.8\% for kink neurons and just 0.8\% for dead ones. This is not because on neurons are more numerous but because they are bigger: their outputs average $\approx 1.5$ in magnitude versus $\approx 0.17$ for kink neurons, so even modest relative errors on the on block dominate everything else. The concentration continues within the on block itself (\Cref{fig:error-concentration}), where the top 10\% of neurons by output magnitude account for 38\% of the squared error and the top 20\% for 61\%.
 
 \subsection{The On-Neuron Error Is Sampling Variance, Not Bias}
 
-Is the on-block error bias or just noise? Pooled over the 50 networks, the mean signed error is $-2.1\times10^{-6}$---more than two orders of magnitude below the error spread of $1.1\times10^{-3}$---so it has no meaningful direction. There is a slight lean toward under-estimation (52.3\% of on neurons land below the truth, as do 29 of the 50 networks), but this is a median effect rather than a bias: frequent small undershoots are balanced by rarer, larger overshoots, so more than half of realizations land low. Because all 256 outputs share the same sample points, each network additionally picks up a common shift, which is why whole networks (not just neurons) lean one way. Further analysis also indicates that the size of the error matches what sampling variance predicts.
+Is the on-block error bias or just noise? Pooled over the 50 networks, the mean signed error is $-2.0\times10^{-5}$---roughly forty times smaller than the error spread of $8.6\times10^{-4}$, so its squared contribution is under $0.1\%$ of the MSE---and it has no meaningful direction. There is a slight lean toward under-estimation (51.4\% of on neurons land below the truth, as do 28 of the 50 networks), but this is a median effect rather than a bias: frequent small undershoots are balanced by rarer, larger overshoots, so more than half of realizations land low. Because all 256 outputs share the same sample points, each network additionally picks up a common shift, which is why whole networks (not just neurons) lean one way. Further analysis also indicates that the size of the error matches what sampling variance predicts.
 
 \subsection{Limitations and Future Work: Heavy Tails and Jointly-Crossing Kinks}
 

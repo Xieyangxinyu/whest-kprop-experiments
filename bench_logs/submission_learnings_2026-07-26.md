@@ -232,3 +232,140 @@ at its predicted size.
 
 n=2 — do not over-fit this, but prefer sync-neutral designs when the FLOP saving is
 comparable.
+
+---
+
+## Submission Log — N=81,920 artifact test (algo56/algo57, submitted late 07-26)
+
+Context: user-directed test of a larger sampling budget. Two artifacts at 40,960 stored
+half-rows (81,920 effective antithetic samples), both on the graded 319266 bytes with only
+`_TOTAL_SAMPLES = 81920` changed. Validation-only gate by design (no local A/B): `whest
+validate` pass, subprocess n=2 seed-42 clean, ~177G billed/net (65% of the 272G budget),
+tarballs 38.87 MB with all four files. Submission ids not printed by whestbench 0.13.0 —
+read from the AIcrowd page if they need citing.
+
+### Seed-recovery attempt for the protected artifact: FALSIFIED (scipy 1.15.3)
+
+Candidates 2, int.from_bytes(b"sobol") big/little (495766970220 / 465425703539), ASCII-concat
+11511198111108, letter-position 191521512, and "2"+ASCII 211511198111108, each under both
+`random(32768)` and `random_base2(15)`: none reproduce the shipped draw — values diverge from
+row 0, so this is not a trim/shape artifact. The shipped file is `(30,720, 256)` (exactly the
+consumed rows; the writeup's "(32,768, 256)" was wrong and is fixed in a6acc6d). The protected
+draw still cannot be extended as a true continuation of its own sequence.
+
+### Submission (id TBD) — algo56-n81920-concat
+
+- Result: **tied** (nominal −0.61%, inside the ~0.5–1% repeat-noise floor from 319031)
+- Change: N=81,920; artifact = shipped 30,720-row protected draw + 10,240-row extension
+  (seed 495766970220, first 10,240 of a 2^14 draw); prefix byte-identical to shipped
+- Local expectation: none claimed (validation-only); smoke on nets 0/10 improved on both
+- Leaderboard: **1.5659658271033176e-07** vs 319266's 1.5755e-07, same-day pair → −0.61%
+- Decision: do not promote on this evidence; a verbatim re-grade of either side would be
+  needed to separate them, and the expected value doesn't justify the slot
+- Lesson: at 0.9.x pricing the +33% FLOP cost of the N-raise almost exactly cancels the
+  added-rows variance gain even with the protected prefix held fixed — fixed-61,440 remains
+  the efficient point, now measured cleanly (prefix-controlled) rather than lottery-confounded.
+
+### Submission (id TBD) — algo57-n81920-seed2
+
+- Result: **regressed +21.8%**
+- Change: N=81,920; artifact = fresh full seed-2 draw (first 40,960 of a 2^16 draw)
+- Local expectation: net 0 looked spectacular (1.53e-7 vs baseline 9.20e-7) — pure lottery
+- Leaderboard: **1.918874139765107e-07**
+- Decision: do not retry fresh-draw artifacts; third confirmation of the 317412 rule
+- Lesson: hidden-realization variance (~30%) dominates any local draw signal; a fresh
+  scramble is a lottery ticket regardless of N.
+
+### What not to try again
+
+- Fresh Sobol scrambles as "maybe better" artifacts (three leaderboard confirmations now).
+- N-raises financed by billed FLOPs on this cost model — the multiplier eats the variance
+  gain; only a FLOP-neutral way to add samples would reopen this axis.
+- Seed archaeology on the shipped artifact under scipy 1.15.3 — the candidate space of
+  memorable seeds is now well covered; treat the artifact as version-locked data.
+
+### Batch: three more independent 82k draws (algo58/59/60, seeds 3/5/7)
+
+User-directed lottery sampling on the same N=81,920 estimator bytes; validation-only gate
+(all passed: validate, subprocess n=1 clean, 38.87 MB tarballs, 4 files).
+
+| artifact | graded | vs 319266 (1.5755e-07) |
+|---|---|---|
+| seed 2 (algo57, earlier) | 1.9189e-07 | +21.8% |
+| seed 3 (algo58) | 2.0090e-07 | +27.5% |
+| seed 5 (algo59) | 1.5724e-07 | −0.2% (tie) |
+| seed 7 (algo60) | 1.9602e-07 | +24.4% |
+| concat/protected prefix (algo56) | 1.5660e-07 | −0.61% (tie) |
+
+- Fresh-draw spread at n=4: min 1.572, max 2.009 (max/min 1.28); median draw ~+23% worse
+  than the incumbent. **Quantifies the artifact lottery at ~25-30% spread** — first clean
+  multi-draw measurement at fixed bytes.
+- The incumbent artifact is confirmed a strong draw: only 1 of 4 fresh scrambles ties it,
+  none beat it beyond noise.
+- The two ties (seed 5 fresh, concat) both sit within noise of 319266 despite +33% billed
+  FLOPs — consistent with the N-raise economics being a wash: a good 82k draw ≈ the good
+  61,440 incumbent.
+- Observation, not a rule change: the 1-net local smoke happened to rank seed 5 best and
+  it was best on hidden too (n=4, one local net) — insufficient against the standing
+  317412 evidence; do not start trusting local draw screening on this.
+- Axis disposition: five slots spent on 82k artifacts, zero net gain. CLOSED unless a
+  FLOP-neutral sample-addition mechanism appears.
+
+### Submission (id TBD) — algo62-n65536-seed5, and the seed-5 N-curve
+
+- Result: **regressed +9.5%** vs standing best (graded **1.7259010523185348e-07**)
+- Change: seed-5 draw, `_TOTAL_SAMPLES = 65536` (2^16 total; first 32,768 artifact rows)
+- Seed-5 N-curve now: 65,536 -> 1.7259e-7; 81,920 -> 1.5724e-7 (−8.9% from more samples)
+- Lesson: the seed-5 draw needs its full 82k budget to tie the incumbent's 61,440 — the
+  protected artifact is strong per-sample, not just lucky in aggregate. N-cuts on a fixed
+  draw lose more to variance than the multiplier returns (consistent with 318756).
+
+### Local test — sobol_burley (hash-based Owen scrambling), no slot spent
+
+Artifact from cessen/sobol_burley v0.5 (Rust, contained toolchain in scratchpad): seed 0,
+40,960 x 256, u clipped to [2^-25, 1-2^-25] (crate emitted no exact 0/1), norm.ppf, f32 —
+`sobol_points_81920_burley0.npz`, staged as algo61-n81920-burley0 (validates, 0 failures).
+
+10-net local A/B at N=81,920, seed 42, identical nets:
+
+| artifact | adjusted | raw MSE |
+|---|---|---|
+| scipy seed-5 | 2.31e-07 | 2.69e-07 |
+| burley seed-0 | 3.02e-07 | 3.46e-07 (+29%) |
+
+- +29% is INSIDE the ~28% single-realization spread measured on hidden today, and seed 5
+  is a locally-lucky scipy draw — this does NOT establish the Burley construction is worse,
+  only that this one Burley realization is mediocre on these 10 nets.
+- A structural verdict needs a multi-seed local mean (e.g. 5 Burley seeds vs 5 scipy seeds,
+  10 nets each) — all local, no slots. Not run yet.
+
+### Submission (id TBD) — algo61-n81920-burley0
+
+- Result: **regressed +28.5%** (graded **2.0250067813837198e-07**)
+- Change: sobol_burley (hash-based Owen scrambling) seed-0 artifact at N=81,920
+- Leaderboard evidence: lands at the bottom of the fresh-draw band (1.572–2.009 scipy);
+  one realization — says nothing structural about the Burley construction
+- Note: local 10-net gap vs seed-5 (+29%) matched the hidden gap (+29%) almost exactly;
+  with seed-5 best-local/best-hidden, that is now 2-for-2 rank agreement today — still far
+  from overturning the 317412 no-local-predictive-value rule, but worth tracking
+- 82k ticket tally (6): concat 1.566 | seed5 1.572 | seed2 1.919 | seed7 1.960 |
+  seed3 2.009 | burley0 2.025. Standing best remains 319266 @ 1.5755e-7 (61,440, protected
+  artifact). Axis remains CLOSED for score; Burley structural question needs the multi-seed
+  local mean, not slots.
+
+### Submission (id TBD) — algo63-n84992-seed5: NOMINAL NEW BEST 1.5514e-07
+
+- Result: **improved** — graded **1.5514080482970139e-07**, −1.53% vs 319266 (1.5755e-7),
+  −1.34% vs its prefix-identical seed-5 parent at 81,920 (1.5724e-7)
+- Change: seed-5 draw extended to 42,496 rows (verified true continuation; first 40,960
+  rows byte-identical to the 82k artifact), `_TOTAL_SAMPLES = 84992`
+- Caveats before promoting: the −1.34% prefix-controlled delta is ~2.7x the measured
+  repeat-noise (0.5%) but CONTRADICTS the economics prediction (+3.75% samples should be
+  a slight net loss at the measured FLOP/variance exchange rate) — consistent with the
+  appended 1,536 halves being a lucky increment, i.e. the within-artifact increment
+  lottery, not a reproducible N-curve effect
+- Seed-5 N-curve: 65,536 -> 1.7259 | 81,920 -> 1.5724 | 84,992 -> 1.5514
+- Fully reproducible construction: scipy 1.15.3, qmc.Sobol(d=256, scramble=True, seed=5),
+  random_base2(16), first 42,496 rows, norm.ppf, f32
+- Decision hook: if promoted, a verbatim re-grade would separate luck-of-window from a
+  real edge (~0.5% repeat noise vs 1.5% margin)

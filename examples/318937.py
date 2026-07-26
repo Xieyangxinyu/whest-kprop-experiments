@@ -37,7 +37,7 @@ _BASE_SAMPLES = 10240
 _TOTAL_SAMPLES = 61440
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
-_PILOT_FRACTION = 0.025
+_PILOT_FRACTION = 0.05
 _PILOT_RECHECK_FRACTION = 0.20
 _PILOT_RECHECK_MARGIN = 0.35
 _PILOT_ON_THRESH = 3.0
@@ -55,7 +55,7 @@ _CAST_WEIGHTS_F32 = True
 _COLD_SLICE = True
 _COLD_START_LAYER = 2   # first layer whose input matmul may be cold-sliced
 _COLD_STOP_LAYER = 29   # fold layers 30/31 are never sliced
-_COLD_FIRE_THRESH = 0.05  # columns firing below this pilot rate are cold
+_COLD_FIRE_THRESH = 0.03  # columns firing below this pilot rate are cold
 _COLD_MIN_K = 8
 _COLD_MAX_K = 64
 _COLD_MIN_HOT_DIM = 96  # keep the hot block Strassen-eligible
@@ -495,7 +495,7 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                x_kink = fnp.maximum(_dense_matmul(x, w_kink), 0.0)
+                x_kink = fnp.maximum(x @ w_kink, 0.0)
                 kink_mean = fnp.mean(x_kink, axis=0)
 
                 mean_prev = fnp.mean(x, axis=0)
@@ -513,13 +513,13 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                pre_from_kink = _dense_matmul(x, w_from_kink)
+                pre_from_kink = x @ w_from_kink
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
                 w_this_from_on = w[fold_on_idx, :][:, kink_idx]
                 w_folded = w_fold_on @ w_this_from_on
-                pre_from_on = _dense_matmul(x_before_fold, w_folded)
+                pre_from_on = x_before_fold @ w_folded
 
                 x_kink = fnp.maximum(pre_from_kink + pre_from_on, 0.0)
                 kink_mean = fnp.mean(x_kink, axis=0)

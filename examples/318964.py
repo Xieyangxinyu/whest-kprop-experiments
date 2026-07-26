@@ -495,7 +495,7 @@ class Estimator(BaseEstimator):
                         active_indices[layer_idx] = idx
 
                 w_kink = w[prev_idx, :][:, kink_idx]
-                x_kink = fnp.maximum(_dense_matmul(x, w_kink), 0.0)
+                x_kink = fnp.maximum(x @ w_kink, 0.0)
                 kink_mean = fnp.mean(x_kink, axis=0)
 
                 mean_prev = fnp.mean(x, axis=0)
@@ -513,13 +513,13 @@ class Estimator(BaseEstimator):
                 fold_prev_idx = active_indices[29]
 
                 w_from_kink = w[prev_idx, :][:, kink_idx]
-                pre_from_kink = _dense_matmul(x, w_from_kink)
+                pre_from_kink = x @ w_from_kink
 
                 w_fold_layer = mlp.weights[30]
                 w_fold_on = w_fold_layer[fold_prev_idx, :][:, fold_on_idx]
                 w_this_from_on = w[fold_on_idx, :][:, kink_idx]
                 w_folded = w_fold_on @ w_this_from_on
-                pre_from_on = _dense_matmul(x_before_fold, w_folded)
+                pre_from_on = x_before_fold @ w_folded
 
                 x_kink = fnp.maximum(pre_from_kink + pre_from_on, 0.0)
                 kink_mean = fnp.mean(x_kink, axis=0)

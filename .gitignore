@@ -36,6 +36,17 @@ Thumbs.db
 # Generated benchmark data
 bench_logs/sample_diagnostics/
 
+# Regenerable notebook prediction caches (rebuilt by the notebooks themselves)
+.algo31_pred_cache.npz
+.algo34_error_cache.npz
+.coldslice_vals_cache.npz
+.coldslice_viz_cache.npz
+.est14_error_cache.npz
+.pred13_cache.npz
+.mlp_lastvar_cache.npz
+.exp_pr150_cache/
+.nb_history_bytes/
+
 # Internal process docs (specs, plans, scratch) — not for participant repo.
 .aicrowd/
 

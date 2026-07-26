@@ -1,6 +1,6 @@
-"""Fixed 61,440-sample estimator: antithetic pilots, 2-level Strassen, recursive cold slicing.
+"""Fixed 84,992-sample estimator: antithetic pilots, 2-level Strassen, recursive cold slicing.
 
-This estimator uses a constant 61,440 antithetic samples (10,240 pilot + 51,200
+This estimator uses a constant 84,992 antithetic samples (10,240 pilot + 74,752
 continuation) for every MLP. Dead/active/on classification probes estimate alpha
 from both antithetic halves (pair-balanced). Sampled active propagation uses a
 guarded 2-level recursive Strassen decomposition. Packed-prefix slicing runs in
@@ -39,7 +39,7 @@ from whestbench import BaseEstimator, SetupContext
 from whestbench.domain import MLP
 
 _BASE_SAMPLES = 10240
-_TOTAL_SAMPLES = 61440
+_TOTAL_SAMPLES = 84992
 _DEAD_THRESH = -3.0
 _ON_THRESH = 3.0
 _PILOT_FRACTION = 0.025

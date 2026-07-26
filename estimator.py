@@ -3,19 +3,24 @@
 This estimator uses a constant 61,440 antithetic samples (10,240 pilot + 51,200
 continuation) for every MLP. Dead/active/on classification probes estimate alpha
 from both antithetic halves (pair-balanced). Sampled active propagation uses a
-guarded 2-level recursive Strassen decomposition. Cold-column slicing runs in
-both blocks:
+guarded 2-level recursive Strassen decomposition. Packed-prefix slicing runs in
+both blocks: each layer's columns are ordered coldest-first, and the leading
+prefix -- wide enough that a row carries ~3 nonzeros across it -- is gathered
+per row instead of multiplied. Rows are scatter-ordered into NNZ buckets, so a
+bucket keeping k columns costs 6*k*m against 2*w*m dense; the old zero-block
+carve survives as the k=0 bucket. The two blocks differ only in how the prefix
+is sized and whether the row order is put back:
 
-- Continuation block: the pilot fire census orders each layer's columns
-  coldest-first; rows are scatter-ordered by their support PATTERN over an
-  ultra-cold / warm-cold split of the cold set, so each pattern group's rows
-  and its needed column slab are contiguous and every correction lands as a
-  plain slice-add (two-level carve from one scatter).
-- Pilot block: columns are ordered by the analytic alpha of the producing
-  layer (a fire-rate predictor available before materialization) and the same
-  single-level carve applies, with the row order RESTORED after each layer via
-  an inverse-permutation scatter so the Sobol-prefix probe rows and the
-  antithetic pairing are untouched.
+- Continuation block: width comes from the pilot fire census (running sum of
+  per-column fire rates), and the row order is left permuted -- only per-column
+  means are read downstream.
+- Pilot block: no census exists yet, so width comes from the analytic alpha of
+  the producing layer via Phi(alpha), and the row order is RESTORED after each
+  layer via an inverse-permutation scatter so the Sobol-prefix probe rows and
+  the antithetic pairing are untouched.
+
+The previous pattern carve (_cold_slice_relu_matmul2 / _plan_cold_slices) is
+retained and reachable with _PREFIX_PACK = False.
 
 Weights are cast to float32 once per layer, and every pipeline value stays
 float32-billed: bool census sums declare a float32 accumulator, the analytic
@@ -69,9 +74,10 @@ _COLD_MIN_K2 = 4
 # the same as the 4-group carve -- and captures 79% of the saving a 7-entry
 # ladder reaches (scratch sweep, net 0: 6.04G vs 7.65G of 140.55G billed).
 _PREFIX_PACK = True
-_PREFIX_NNZ_TARGET = 2.5    # widen the prefix until its EXPECTED nnz reaches this
-_PREFIX_LADDER = (0, 2, 6)  # NNZ buckets; rows above the last fall back to dense
+_PREFIX_NNZ_TARGET = 3.0    # widen the prefix until its EXPECTED nnz reaches this
+_PREFIX_LADDER = (0, 1, 2, 4, 8)  # NNZ buckets; rows above the last fall back to dense
 _PREFIX_MIN_S = 8
+_PREFIX_BASE = True         # also pack the pilot pass (needs the row-order restore)
 _PILOT_COLD = True
 _PILOT_ALPHA_COLD = -1.88  # Phi(alpha) ~= 0.03: analytic proxy for the fire threshold
 _PILOT_MIN_K = 8
@@ -285,7 +291,7 @@ def _cold_slice_relu_matmul2(x, w_active, kc, kc2):
     return fnp.concatenate(parts, axis=0)
 
 
-def _prefix_pack_relu_matmul(x, w_active, s, ladder):
+def _prefix_pack_relu_matmul(x, w_active, s, ladder, restore=False):
     """Exact relu(x @ w) with the first s input columns gathered per row instead
     of multiplied. Columns are already ordered coldest-first, so [0, s) is a free
     slice and its rows carry very few nonzeros. Rows are scattered into NNZ
@@ -293,7 +299,12 @@ def _prefix_pack_relu_matmul(x, w_active, s, ladder):
     only ladder[g] columns; rows above the ladder fall back to a dense prefix
     matmul. Because a bucket's rows have nnz <= k, argpartition on the support
     mask returns a superset of each row's nonzeros -- the extra picks are zeros
-    and contribute nothing, so the result is exact (up to fp reassociation)."""
+    and contribute nothing, so the result is exact (up to fp reassociation).
+
+    With restore=True the row order is put back afterwards (inverse-permutation
+    scatter, as _cold_slice_relu_matmul_restore does) so the Sobol-prefix probe
+    rows and the antithetic pairing stay in place -- required in the pilot pass,
+    unnecessary in the continuation block where only per-column means are read."""
     n = x.shape[0]
     nnz = fnp.sum(x[:, :s] > fnp.float32(0.0), axis=1, dtype=fnp.float32)
     sel = []
@@ -340,9 +351,28 @@ def _prefix_pack_relu_matmul(x, w_active, s, ladder):
         parts.append(fnp.maximum(pre_hot[a:b] + corr, 0.0))
     if acc < n:
         parts.append(fnp.maximum(pre_hot[acc:] + xp[acc:, :s] @ w_pre, 0.0))
-    if len(parts) == 1:
-        return parts[0]
-    return fnp.concatenate(parts, axis=0)
+    y = parts[0] if len(parts) == 1 else fnp.concatenate(parts, axis=0)
+    if not restore:
+        return y
+    inv = fnp.zeros(n, dtype=fnp.int32)
+    fnp.put_along_axis(inv, dest, fnp.arange(n, dtype=fnp.int32), axis=0)
+    out_buf = fnp.zeros(y.shape, dtype=fnp.float32)
+    fnp.put_along_axis(out_buf, fnp.broadcast_to(inv[:, None], y.shape), y, axis=0)
+    return out_buf
+
+
+def _prefix_width_from_alpha(alpha_sorted, max_s):
+    """Base-block prefix sizing. The pilot pass has no fire census yet -- it is
+    the pass that builds one -- so the per-column fire rate comes from the
+    analytic alpha: Phi(alpha) is the fire probability, and its running sum along
+    the alpha-sorted columns is the mean nonzeros a row carries over that prefix.
+    Same _PREFIX_NNZ_TARGET stop as _plan_prefix_pack. The .astype(float32) is
+    load-bearing: flops.stats.norm.cdf returns float64 even on float32 input and
+    would promote everything downstream to the 2x billing rate."""
+    rate = flops.stats.norm.cdf(alpha_sorted).astype(fnp.float32)
+    cum = fnp.cumsum(rate)
+    s = int(fnp.sum(cum <= fnp.float32(_PREFIX_NNZ_TARGET), dtype=fnp.float32))
+    return min(s, max_s)
 
 
 def _cold_slice_relu_matmul_restore(x, w_active, kc):
@@ -646,21 +676,36 @@ class Estimator(BaseEstimator):
                     active_indices[layer_idx] = idx
                 w_active = w[prev_idx, :][:, idx]
                 if refine:
-                    kp = 0
+                    sp = 0
                     if (
-                        _PILOT_COLD
+                        _PREFIX_BASE
                         and 2 <= layer_idx <= 29
-                        and len(prev_idx) >= _COLD_MIN_HOT_DIM + _PILOT_MIN_K
+                        and len(prev_idx) >= _COLD_MIN_HOT_DIM + _PREFIX_MIN_S
                     ):
-                        kp = int(fnp.sum(
-                            alpha_rows[layer_idx - 1][prev_idx] < fnp.float32(_PILOT_ALPHA_COLD),
-                            dtype=fnp.float32,
-                        ))
-                        kp = min(kp, _PILOT_MAX_K, len(prev_idx) - _COLD_MIN_HOT_DIM)
-                    if kp >= _PILOT_MIN_K:
-                        x = _cold_slice_relu_matmul_restore(x, w_active, kp)
+                        sp = _prefix_width_from_alpha(
+                            alpha_rows[layer_idx - 1][prev_idx],
+                            len(prev_idx) - _COLD_MIN_HOT_DIM,
+                        )
+                    if sp >= _PREFIX_MIN_S:
+                        x = _prefix_pack_relu_matmul(
+                            x, w_active, sp, _PREFIX_LADDER, restore=True
+                        )
                     else:
-                        x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
+                        kp = 0
+                        if (
+                            _PILOT_COLD
+                            and 2 <= layer_idx <= 29
+                            and len(prev_idx) >= _COLD_MIN_HOT_DIM + _PILOT_MIN_K
+                        ):
+                            kp = int(fnp.sum(
+                                alpha_rows[layer_idx - 1][prev_idx] < fnp.float32(_PILOT_ALPHA_COLD),
+                                dtype=fnp.float32,
+                            ))
+                            kp = min(kp, _PILOT_MAX_K, len(prev_idx) - _COLD_MIN_HOT_DIM)
+                        if kp >= _PILOT_MIN_K:
+                            x = _cold_slice_relu_matmul_restore(x, w_active, kp)
+                        else:
+                            x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
                 else:
                     plan = cold_plan.get(layer_idx) if cold_plan else None
                     if plan is None:

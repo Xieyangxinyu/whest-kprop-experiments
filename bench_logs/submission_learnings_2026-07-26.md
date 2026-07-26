@@ -132,3 +132,73 @@ Open follow-ups, not pursued:
   a grader measurement shows syncs are cheaper than 318873 implied.
 - The hot block is untouched and stays ~60% dense; the only remaining lever there is the
   rank-8 truncation idea, which is lossy and needs a truncation-bias curve first.
+
+---
+
+## algo47: base-block packing + wider ladder (bundle on top of algo46)
+
+Two extensions to the graded 1.5951e-07 surface, measured separately and together.
+
+### 1. Base/pilot block packing (`_PREFIX_BASE`)
+
+The pilot pass (10,240 samples) was still on the old single-level carve
+(`_cold_slice_relu_matmul_restore`). Same packed-prefix code now applies there, with
+`restore=True` — the pilot pass MUST keep row order (Sobol-prefix probe rows and the
+antithetic pairing), so it pays the inverse-permutation scatter the carve variant already
+paid. Cost-neutral on that axis.
+
+Prefix width can't use a fire census there (that pass is what builds one), so it comes from
+the analytic alpha: `Phi(alpha)` is the per-column fire rate and its running sum is the mean
+nonzeros over the prefix — same `_PREFIX_NNZ_TARGET` stop. Costs ~p ops/layer instead of the
+2*n*p a direct measurement off `x` would need. **`flops.stats.norm.cdf(...).astype(float32)`
+— the cast is load-bearing** (f64 leak promotes everything downstream to 2x billing).
+
+### 2. Wider ladder, swept on 5 nets
+
+Joint (target x ladder) sweep over nets 0/10/20/30/40, baselined on the shipped
+target 2.5 / `(0,2,6)`:
+
+| target | ladder | vs shipped | syncs/net |
+|---|---|---|---|
+| 3.0 | `(0,1,2,4,8,16)` | -1.66% | 140 |
+| 3.0 | `(0,1,2,4,8)` | -1.61% | 140 |
+| 3.0 | `(0,2,4,8,16)` | -1.32% | 112 |
+| 2.5 | `(0,2,6)` (shipped) | — | 84 |
+
+Consistent across nets (worst -1.29%, best -1.88%). The 6th bucket adds nothing over 5
+(-1.66 vs -1.61), so `(0,1,2,4,8)` at target 3.0 — same saving, one fewer group.
+
+### FLOP-only A/B, 10 mini nets seed 0
+
+| arm | dFLOPs | d raw MSE | d adjusted | max abs delta |
+|---|---|---|---|---|
+| +base | -1.30% | +0.002% | -1.27% | 1.19e-06 |
+| +ladder | -1.21% | +0.047% | -1.00% | 1.20e-05 |
+| **+both** | **-2.77%** | +0.049% | **-2.53%** | 1.22e-05 |
+
+Additive, slightly super-additive.
+
+### `whest run` local, seed 42, n=10 (lambda*R included), vs the GRADED algo46
+
+| arm | adjusted | vs algo46 | flops | residual |
+|---|---|---|---|---|
+| algo46 (graded 1.5951e-07) | 2.38952e-07 | — | 139.31G | 0.0591s |
+| base only | 2.37089e-07 | -0.78% | 137.48G | 0.0656s |
+| **bundle** | **2.34483e-07** | **-1.87%** | 135.31G | 0.0708s |
+
+raw MSE flat (4.5461e-07 -> 4.5469e-07). 0 failures. Subprocess n=3: 2.8639e-07 vs algo46's
+2.9321e-07 (-2.33%), 0 failures, all-zero breakdown.
+
+### LESSON: syncs are cheap but not free — and now they are priced
+
+algo46 held syncs at 81/net and residual moved +2ms, which said nothing about marginal sync
+cost. This bundle takes syncs to ~140/net and residual went 0.0591s -> 0.0708s (+11.7ms
+~ +1.17G). That ate **26% of the 4.0G FLOP saving** — the FLOP-only estimate of -2.53%
+became -1.87% under lambda*R.
+
+Working number: **~0.2ms per host sync**, i.e. ~20 MFLOP each. Far below the ~350 MFLOP/sync
+that 318873's "28 syncs ~ 0.1s" implied — that figure bundled a scatter and overstated syncs
+badly. Use 0.2ms/sync for future ladder/bucket decisions.
+
+Base-only is the sync-cheap half (-0.78% for +6.5ms) but not worth shipping alone; the
+bundle is 2.4x better and still clears the ~0.5% noise floor by ~3.7x.

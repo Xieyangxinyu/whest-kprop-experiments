@@ -62,6 +62,16 @@ _COLD_MIN_HOT_DIM = 96  # keep the hot block Strassen-eligible
 _COLD_REORDER = "put"   # 'put' = scatter reorder; 'take' = gather fallback
 _COLD_FIRE_THRESH2 = 0.01  # inner (ultra-cold) recursion cut
 _COLD_MIN_K2 = 4
+# Packed-prefix path: supersedes the pattern carve when on. Instead of splitting
+# the cold set into slabs and skipping the slabs a row misses, sort rows by their
+# NNZ over one wide prefix and gather each bucket's live columns. The carve
+# survives as the k=0 bucket. Ladder (0, 2, 6) costs 3 host syncs per layer --
+# the same as the 4-group carve -- and captures 79% of the saving a 7-entry
+# ladder reaches (scratch sweep, net 0: 6.04G vs 7.65G of 140.55G billed).
+_PREFIX_PACK = True
+_PREFIX_NNZ_TARGET = 2.5    # widen the prefix until its EXPECTED nnz reaches this
+_PREFIX_LADDER = (0, 2, 6)  # NNZ buckets; rows above the last fall back to dense
+_PREFIX_MIN_S = 8
 _PILOT_COLD = True
 _PILOT_ALPHA_COLD = -1.88  # Phi(alpha) ~= 0.03: analytic proxy for the fire threshold
 _PILOT_MIN_K = 8
@@ -270,6 +280,66 @@ def _cold_slice_relu_matmul2(x, w_active, kc, kc2):
     ns = nb + nu + nw
     if ns < n:
         parts.append(fnp.maximum(pre_hot[ns:], 0.0))
+    if len(parts) == 1:
+        return parts[0]
+    return fnp.concatenate(parts, axis=0)
+
+
+def _prefix_pack_relu_matmul(x, w_active, s, ladder):
+    """Exact relu(x @ w) with the first s input columns gathered per row instead
+    of multiplied. Columns are already ordered coldest-first, so [0, s) is a free
+    slice and its rows carry very few nonzeros. Rows are scattered into NNZ
+    buckets: bucket g holds rows with ladder[g-1] < nnz <= ladder[g] and keeps
+    only ladder[g] columns; rows above the ladder fall back to a dense prefix
+    matmul. Because a bucket's rows have nnz <= k, argpartition on the support
+    mask returns a superset of each row's nonzeros -- the extra picks are zeros
+    and contribute nothing, so the result is exact (up to fp reassociation)."""
+    n = x.shape[0]
+    nnz = fnp.sum(x[:, :s] > fnp.float32(0.0), axis=1, dtype=fnp.float32)
+    sel = []
+    lo = fnp.float32(-1.0)
+    for lim in ladder:
+        hi = fnp.float32(float(lim))
+        sel.append(((nnz > lo) & (nnz <= hi)).astype(fnp.float32))
+        lo = hi
+    sel.append((nnz > lo).astype(fnp.float32))  # dense tail
+    csums = [fnp.cumsum(g) for g in sel]
+    counts = [int(c[-1]) for c in csums[:-1]]  # one sync per bucket; tail inferred
+
+    starts, acc = [], 0
+    for c in counts:
+        starts.append(acc)
+        acc += c
+    starts.append(acc)
+    if acc == 0:  # every row is in the dense tail -- nothing to gain
+        return fnp.maximum(_dense_matmul(x, w_active), 0.0)
+
+    dest_f = None
+    for g, (sg, cg) in enumerate(zip(sel, csums)):
+        term = sg * (cg + fnp.float32(float(starts[g] - 1)))
+        dest_f = term if dest_f is None else dest_f + term
+    dest = dest_f.astype(fnp.int32)
+    xp = fnp.zeros(x.shape, dtype=fnp.float32)
+    fnp.put_along_axis(xp, fnp.broadcast_to(dest[:, None], x.shape), x, axis=0)
+
+    pre_hot = _dense_matmul(xp[:, s:], w_active[s:, :])
+    w_pre = w_active[:s, :]
+    parts = []
+    for g, lim in enumerate(ladder):
+        a, b = starts[g], starts[g + 1]
+        if b <= a:
+            continue
+        k = min(int(lim), s)
+        if k <= 0:  # the surviving carve: these rows are zero across the prefix
+            parts.append(fnp.maximum(pre_hot[a:b], 0.0))
+            continue
+        sub = xp[a:b, :s]
+        order = fnp.argpartition(sub > fnp.float32(0.0), s - k, axis=1)[:, -k:]
+        vals = fnp.take_along_axis(sub, order, axis=1)
+        corr = fnp.einsum("nk,nko->no", vals, fnp.take(w_pre, order, axis=0))
+        parts.append(fnp.maximum(pre_hot[a:b] + corr, 0.0))
+    if acc < n:
+        parts.append(fnp.maximum(pre_hot[acc:] + xp[acc:, :s] @ w_pre, 0.0))
     if len(parts) == 1:
         return parts[0]
     return fnp.concatenate(parts, axis=0)
@@ -593,10 +663,12 @@ class Estimator(BaseEstimator):
                         x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
                 else:
                     plan = cold_plan.get(layer_idx) if cold_plan else None
-                    if plan:
-                        x = _cold_slice_relu_matmul2(x, w_active, plan[0], plan[1])
-                    else:
+                    if plan is None:
                         x = fnp.maximum(_dense_matmul(x, w_active), 0.0)
+                    elif _PREFIX_PACK:
+                        x = _prefix_pack_relu_matmul(x, w_active, plan, _PREFIX_LADDER)
+                    else:
+                        x = _cold_slice_relu_matmul2(x, w_active, plan[0], plan[1])
             if (
                 refine
                 and _COLD_SLICE
@@ -643,7 +715,12 @@ class Estimator(BaseEstimator):
             mlp, structure, base_x, _BASE_SAMPLES, refine=True
         )
         extra_samples = _TOTAL_SAMPLES - _BASE_SAMPLES
-        cold_plan = _plan_cold_slices(refined_structure, _BASE_SAMPLES) if _COLD_SLICE else None
+        if _PREFIX_PACK:
+            cold_plan = _plan_prefix_pack(refined_structure, _BASE_SAMPLES)
+        elif _COLD_SLICE:
+            cold_plan = _plan_cold_slices(refined_structure, _BASE_SAMPLES)
+        else:
+            cold_plan = None
         extra_x = self._sample_block(_BASE_SAMPLES // 2, extra_samples // 2, width)
         extra_rows, _, _ = self._run_block(
             mlp, refined_structure, extra_x, extra_samples, refine=False, cold_plan=cold_plan
@@ -693,4 +770,40 @@ def _plan_cold_slices(structure, n_pilot: int):
         order = fnp.argsort(fire_cnt)
         active[j - 1] = idx[order]
         plan[j] = (k, k2)
+    return plan
+
+
+def _plan_prefix_pack(structure, n_pilot: int):
+    """Packed-prefix sibling of _plan_cold_slices: same coldest-first reorder (it
+    is what makes the prefix a free contiguous slice), but the prefix runs past
+    the cold set. Width is set by EXPECTED nnz, not by a fire-rate cut: walking
+    the sorted fire rates, the cumulative sum is the mean nonzeros a row carries
+    over that prefix, and we stop at _PREFIX_NNZ_TARGET. That is the quantity the
+    ladder has to cover -- a fixed fire-rate cut ignores it and lands far too wide
+    in early layers (s=98 with 97% of rows above the ladder, all falling back to a
+    dense prefix matmul). Clamped so the trailing hot block stays >=
+    _COLD_MIN_HOT_DIM: below _STRASSEN_MIN_DIM it loses the Strassen discount and
+    the change inverts."""
+    fire_stats = structure.get("fire_stats") or {}
+    active = structure["active_indices"]
+    plan = {}
+    inv_pilot = fnp.float32(1.0 / float(n_pilot))
+    target = fnp.float32(_PREFIX_NNZ_TARGET)
+    for j in range(_COLD_START_LAYER, _COLD_STOP_LAYER + 1):
+        fire_cnt = fire_stats.get(j - 1)
+        if fire_cnt is None or j >= len(active):
+            continue
+        idx = active[j - 1]
+        acts = len(idx)
+        out_j = len(active[j])
+        if acts == 0 or out_j == 0 or len(fire_cnt) != acts:
+            continue
+        order = fnp.argsort(fire_cnt)
+        cum = fnp.cumsum(fnp.take(fire_cnt, order)) * inv_pilot
+        s = int(fnp.sum(cum <= target, dtype=fnp.float32))
+        s = min(s, acts - _COLD_MIN_HOT_DIM)
+        if s < _PREFIX_MIN_S:
+            continue
+        active[j - 1] = idx[order]
+        plan[j] = s
     return plan

@@ -202,3 +202,33 @@ badly. Use 0.2ms/sync for future ladder/bucket decisions.
 
 Base-only is the sync-cheap half (-0.78% for +6.5ms) but not worth shipping alone; the
 bundle is 2.4x better and still clears the ~0.5% noise floor by ~3.7x.
+
+### GRADED — NEW BEST 1.5755e-07
+
+`submission-algo47-bundle.tar.gz` (staged in `submissions/algo47-bundle/`), shipped bytes
+byte-identical to commit 3181727.
+
+- **Graded 1.5755419799438493e-07**, previous best 1.5951e-07 (algo46) -> **-1.23%**
+- Cumulative over the day: 1.6605e-07 (319031) -> 1.5755e-07 = **-5.12%**
+
+### LESSON — transfer rate depends on whether the gain is FLOP-pure or residual-mediated
+
+Two data points from today, same surface, same day, same grader:
+
+| submission | local predicted | grader delivered | transfer |
+|---|---|---|---|
+| algo46 (syncs held flat, pure FLOP cut) | -3.65% | -3.94% | **108%** |
+| algo47 (FLOP cut MINUS a residual cost) | -1.87% | -1.23% | **66%** |
+
+algo46 changed FLOPs and left residual alone (+2ms). algo47's net local gain was
+`4.0G FLOPs saved - 1.17G residual cost`, i.e. a quarter of it was a lambda*R bet on local
+machine speed — and that quarter is the part that under-delivered. Consistent with the
+standing 315844/315892 and 316260 lesson, now with a magnitude attached.
+
+Refinement to the exactness rule: **raw-MSE-flat is necessary but not sufficient for full
+transfer.** Also ask what fraction of the local gain is `lambda*R` rather than FLOPs, and
+discount that fraction. Both submissions were raw-MSE-flat; only the FLOP-pure one landed
+at its predicted size.
+
+n=2 — do not over-fit this, but prefer sync-neutral designs when the FLOP saving is
+comparable.

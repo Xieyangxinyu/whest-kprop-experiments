@@ -22,7 +22,7 @@ The main ingredients of the submitted estimator are as follows.
 \begin{enumerate}[leftmargin=*]
     \item A diagonal moment-propagation pass that classifies neurons into dead, kink, and on regimes.
     \item A staged active-set refinement scheme that uses small pilot sample prefixes to correct high-impact classification errors, especially in late layers.
-    \item Network-behavior-driven implementation decisions: neurons that are almost always active are handled analytically in the last two layers, the high-fire block uses guarded Strassen multiplication, and rarely-firing cold columns are sliced out of the sampled matrix products exactly where they contribute nothing.
+    \item Network-behavior-driven implementation decisions: neurons that are almost always active are handled analytically in the last two layers, the high-fire block uses guarded Strassen multiplication, and the rarely-firing cold band is packed out of the sampled matrix products exactly: rows are grouped by how few of those columns they fire on, and each group multiplies only the columns it touches.
     \item A compute-oriented implementation that keeps these structural operations inside \fnp{} and treats compute reductions as consequences of the same routing decisions.
 \end{enumerate}
 

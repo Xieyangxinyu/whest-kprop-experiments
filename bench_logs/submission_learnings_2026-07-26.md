@@ -203,10 +203,10 @@ badly. Use 0.2ms/sync for future ladder/bucket decisions.
 Base-only is the sync-cheap half (-0.78% for +6.5ms) but not worth shipping alone; the
 bundle is 2.4x better and still clears the ~0.5% noise floor by ~3.7x.
 
-### GRADED — NEW BEST 1.5755e-07
+### GRADED — NEW BEST 1.5755e-07 (submission 319266)
 
 `submission-algo47-bundle.tar.gz` (staged in `submissions/algo47-bundle/`), shipped bytes
-byte-identical to commit 3181727.
+byte-identical to commit 3181727 and archived verbatim as `examples/319266.py`.
 
 - **Graded 1.5755419799438493e-07**, previous best 1.5951e-07 (algo46) -> **-1.23%**
 - Cumulative over the day: 1.6605e-07 (319031) -> 1.5755e-07 = **-5.12%**

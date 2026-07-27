@@ -4,11 +4,10 @@
 
 Before choosing an algorithm, we selected a few example MLPs and drew a large number of Monte Carlo samples to visualize the pre-activation distribution for each neuron under Gaussian inputs. We noticed that, particularly for the middle and later layers of the MLP, there were many pre-activation distributions with almost all probability mass below zero, some with substantial probability mass near zero, and others with almost all probability mass above zero. These are the empirical dead, kink, and on regimes in \Cref{fig:layer-collapse-classification}.
 
-By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For a column $j$ of $W_\ell$, the preactivation moments are approximated by
-
+By using the weights of the MLP to predict each neuron's regime prior to any sampling, we can create a white-box estimator that leverages the classical observation that rectifiers produce sparse active sets \citep{nair2010rectified,glorot2011deep}. Suppose the previous post-ReLU activations have approximate mean $\mu_{\ell-1}$ and diagonal variance $v_{\ell-1}$. For each output neuron $j$ (column $j$ of $W_\ell$), the preactivation moments are approximated by
 \begin{align}
-    \mu_{\ell,j}^{\rm pre} &= \sum_i W_{\ell,ij}\mu_{\ell-1,i}, \label{eq:pre-mean}\\
-    (\sigma_{\ell,j}^{\rm pre})^2 &= \sum_i W_{\ell,ij}^2 v_{\ell-1,i}. \label{eq:pre-var}
+    \mu_{\ell,j}^{\rm pre} &= \sum_i \mu_{\ell-1,i}\,W_{\ell,ij}, \label{eq:pre-mean}\\
+    (\sigma_{\ell,j}^{\rm pre})^2 &= \sum_i v_{\ell-1,i}\,W_{\ell,ij}^2. \label{eq:pre-var}
 \end{align}
 Writing $\alpha_{\ell,j}=\mu_{\ell,j}^{\rm pre}/\sigma_{\ell,j}^{\rm pre}$ and denoting the standard normal density and CDF by $\phi$ and $\Phi$, the Gaussian ReLU moment update is
 \begin{align}

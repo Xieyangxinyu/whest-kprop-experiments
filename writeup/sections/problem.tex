@@ -1,11 +1,21 @@
 \section{Problem Setup and Notation}
 
-Let $x_0\sim N(0,I)$ and let an MLP of depth $L$ and width $d$ be defined by
+We consider a fully connected feed-forward neural network (a multilayer perceptron, MLP) with ReLU activations and no bias terms. The network has \emph{depth} $L$, the number of layers, and \emph{width} $d$, the number of neurons in every layer; layer $\ell$ is parameterized by a weight matrix $W_\ell\in\R^{d\times d}$. Throughout we use row-vector notation: activations are row vectors that multiply the weight matrices from the left, matching the samples-as-rows layout of the implementation. The input $x_0\sim N(0,I_d)$ is a random row vector whose $d$ coordinates are independent standard Gaussians (mean $0$, variance $1$), and the layers compute
 \begin{align}
-    z_\ell &= x_{\ell-1} W_\ell, \\
-    x_\ell &= \relu(z_\ell), \qquad \ell=1,\ldots,L.
+    z_\ell &= x_{\ell-1} W_\ell \in \R^d, \\
+    x_\ell &= \relu(z_\ell) \in \R^d, \qquad \ell=1,\ldots,L,
 \end{align}
-The target is the matrix of post-ReLU means
+where $\relu(z)=\max(z,0)$ is applied elementwise; $z_\ell$ is called the \emph{pre-activation} and $x_\ell$ the (post-ReLU) \emph{activation} of layer $\ell$. In $W_\ell$, row $i$ holds the outgoing weights of input neuron $i$, and column $j$ holds the incoming weights of output neuron $j$: entry $W_{\ell,ij}$ is the weight from neuron $i$ of layer $\ell-1$ to neuron $j$ of layer $\ell$, so $z_{\ell,j}=\sum_i x_{\ell-1,i}\,W_{\ell,ij}$.
+
+Given only the weights $W_1,\ldots,W_L$, the estimator must output the matrix of mean activations
 \begin{align}
-    m_\ell = \E[x_\ell]\in\R^d,\qquad \ell=1,\ldots,L.
+    M = \begin{pmatrix} m_1 \\ \vdots \\ m_L \end{pmatrix} \in \R^{L\times d},
+    \qquad m_\ell = \E[x_\ell]\in\R^d,\qquad \ell=1,\ldots,L,
 \end{align}
+where the expectation is taken over the random input $x_0$.
+
+The challenge networks have depth $L=32$ and width $d=256$. Although all $L$ rows are reported, accuracy is scored only on the last-layer means: writing $\widehat m_L$ for the predicted final row, the score is the mean squared error
+\begin{align}
+    \mse(\widehat m_L, m_L) = \frac{1}{d}\sum_{j=1}^{d}\left(\widehat m_{L,j} - m_{L,j}\right)^2,
+\end{align}
+multiplied by the compute penalty $\max(0.1,\, C/B)$, where $C$ is the compute the estimator consumed, measured in floating-point operations (FLOPs), and $B$ is the per-network FLOP budget; lower is better. The earlier rows $m_1,\ldots,m_{L-1}$ are diagnostics, so the estimation problem is, in effect, to approximate $m_L$ as accurately as possible within the compute budget.

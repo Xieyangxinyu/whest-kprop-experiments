@@ -1,133 +1,125 @@
 \section{Discussion}
 
+\begin{figure}[hbt!]
+	\centering
+	\includegraphics[width=\linewidth]{figures/activation_function_shapes.png}
+	\caption{The three activation functions used in the ablation study.}
+	\label{fig:activation-function-shapes}
+\end{figure}
+
 The estimator is not a pure cumulant-propagation or covariance-propagation method \citep{wright2024analytic, wu2026estimating}. Instead, it combines analytical approximations with antithetic Sobol sampling. Its primary mechanistic contribution is using structural information about the MLP to sample more strategically: the diagonal Gaussian pass first predicts which neurons are dead, kink, and on; the pilot samples refine uncertain classifications; and the resulting activation structure determines both which neurons are sampled and how the sampled matrix products are evaluated. We hope our methods can serve as a sampling baseline for more sophisticated white-box estimators that exploit the same mechanistic structure.
 
-A useful stress test is to ask what the estimator's premises depend on. We run two ablation studies, varying the nonlinearity and the architecture independently, to see whether the estimator's assumptions survive. Each ablation is run on a matched random MLP with width 256, depth 32, and He-scaled Gaussian weights.
+A useful stress test is to ask what the estimator's premises depend on. We run two ablation studies, varying the nonlinearity and the architecture independently, to see whether the estimator's assumptions survive. Each ablation is run on a matched random MLP with width 256, depth 32, and He-initialized Gaussian weights.
 
-Both ablations report the \emph{effective rank} of the activation covariance, so we fix that quantity here. Let $\Sigma_\ell \in \mathbb{R}^{n \times n}$ be the empirical covariance of the layer-$\ell$ activations over the sampled inputs, with eigenvalues $\lambda_1 \ge \dots \ge \lambda_n \ge 0$. We use the participation-ratio form
+Both ablations report the \emph{effective rank} of the activation covariance, which we define here. Let $\Sigma_\ell \in \mathbb{R}^{n \times n}$ be the empirical covariance of the layer-$\ell$ activations over the sampled inputs, with eigenvalues $\lambda_1 \ge \dots \ge \lambda_n \ge 0$. We use the participation-ratio form
 \begin{equation}
 	\erank(\Sigma_\ell)
 	\;=\; \frac{\left(\sum_{i=1}^{n} \lambda_i\right)^{2}}{\sum_{i=1}^{n} \lambda_i^{2}}
 	\;=\; \frac{(\tr \Sigma_\ell)^{2}}{\|\Sigma_\ell\|_F^{2}},
 	\label{eq:effective-rank}
 \end{equation}
-which is scale-free, equals $k$ when $k$ eigenvalues are equal and the rest vanish, and drops toward $1$ as the spectrum concentrates on a single direction. It is a smooth stand-in for $\rank(\Sigma_\ell)$ that does not require a cutoff on near-zero eigenvalues --- which matters here, because the SiLU stack decays to an activation scale of $4.6\times10^{-5}$ and any absolute threshold would report its rank as a property of the threshold. Note that this is the participation ratio rather than the entropy-based effective rank of \citet{roy2007effectiverank}; the two agree qualitatively but not numerically.
+which is scale-free, equals $k$ when $k$ eigenvalues are equal and the rest vanish, and drops toward $1$ as the spectrum concentrates on a single direction. It is a smooth stand-in for $\rank(\Sigma_\ell)$ that does not require a cutoff on near-zero eigenvalues --- which matters here, because the SiLU stack decays to an activation scale of $4.6\times10^{-5}$ and any absolute threshold would report its rank as a property of the threshold. Note that this is the participation ratio rather than the entropy-based effective rank of \citet{roy2007effectiverank}.
 
-The first ablation varies the \emph{nonlinearity}. \Cref{fig:activation-function-regimes,fig:activation-function-covariance} repeat the diagnostic with ReLU, GELU \citep{hendrycks2016gelu}, and SiLU \citep{elfwing2018silu}. The result is not activation-agnostic. Although ReLU creates literal always-off and always-on regions, GELU and SiLU produce neither. What changes instead is the scale: SiLU attenuates by ${\times}0.72$ per layer, so its typical activation falls to $4.6\times10^{-5}$ by depth 32 while its firing-rate structure stays close to ReLU's. This distinction matters methodologically as well as mechanistically. Any diagnostic that classifies neurons by an absolute magnitude cutoff will report an entire SiLU layer as dead once the decaying scale passes that cutoff, which is a property of the threshold and not of the network; the views in \cref{fig:activation-function-regimes} avoid it by plotting magnitude and firing rate as separate, threshold-free quantities. The broader lesson is still mechanistic: inspect the activation distribution and sample matrix first, then choose the computation that matches that network's behavior.
+\subsection{Activation Functions}
 
-\begin{figure}[p]
+\begin{figure}[hbt!]
 	\centering
 	\includegraphics[width=\linewidth]{figures/activation_function_neuron_maps.png}
-	\caption{Two threshold-free views of every neuron at every depth, for matched random MLPs under ReLU, GELU, and SiLU. Left: the typical activation magnitude $\overline{|a|}$ on a shared log scale. Right: the firing rate, which is scale-free. Neurons are re-sorted by firing rate within each layer, so only the right panel is monotone by construction and the ordering visible on the left is real. ReLU holds its scale and splits into hard cold and hot blocks; SiLU keeps a comparable firing-rate structure while its scale decays by ${\times}0.72$ per layer to $4.6\times10^{-5}$ by depth 32. The SiLU stack is vanishing in magnitude, not dying.}
+	\caption{The activation magnitude $\overline{|a|}$ on a shared log scale for three networks with different activation functions.}
 	\label{fig:activation-function-regimes}
 \end{figure}
 
-\begin{figure}[p]
+The first ablation varies the \emph{nonlinearity}. \Cref{fig:activation-function-regimes,fig:activation-function-covariance} repeat the diagnostic with ReLU, GELU \citep{hendrycks2016gelu}, and SiLU \citep{elfwing2018silu}. The latter two activations are smooth, see \cref{fig:activation-function-shapes}, and therefore do not produce the hard dead and always-on populations that the estimator exploits. 
+
+\begin{figure}[hbt!]
 	\centering
 	\includegraphics[width=\linewidth]{figures/activation_function_covariance_comparison.png}
-	\caption{Activation covariance and rank-collapse comparison for the matched activation functions. Columns are ordered by each neuron's mean absolute correlation with the rest of its layer, so weakly coupled neurons collect at the top left and the correlated core at the bottom right; the white-to-red scale and its colorbar are shared across all panels. Ordering by firing rate instead would organize only the ReLU row, since a smooth activation emits a nonzero value on both sides of the kink and its fire fraction carries almost no information about coupling. All three collapse onto a late correlated core, but only ReLU does so with the exact dead/on identities the submitted estimator exploits.}
+	\caption{Activation covariance comparison for the matched activation functions. Columns are ordered by each neuron's mean absolute correlation with the rest of its layer, so weakly coupled neurons collect at the top left and the correlated core at the bottom right; the white-to-red scale and its colorbar are shared across all panels. All three collapse onto a late correlated core, but only ReLU does so with the exact dead/on identities the submitted estimator exploits.}
 	\label{fig:activation-function-covariance}
 \end{figure}
 
-The second ablation varies the \emph{architecture} instead, and is read off the identical pair of plots. \Cref{fig:architecture-regimes,fig:architecture-covariance}, summarized in \cref{tab:architecture-ablation}, compare six wirings on the same weight tensors --- plain $\relu(Wx)$, a residual block $x + \relu(Wx)$, batch, layer, and RMS normalization applied to the pre-activation, and a pre-norm residual block $x + \relu(W\,\mathrm{LN}(x))$ --- so any difference is attributable to the wiring alone. BatchNorm is used in its inference-time form, a fixed per-neuron affine calibrated from population statistics. The estimator's premises do not survive uniformly. In the plain stack, the scored layer splits $73/106/77$ into dead, kink, and always-on, and the cold prefix that the packed-prefix rule can skip exactly averages $35.3\%$ of the width. Under BatchNorm and under the pre-norm residual block, every one of the 256 neurons at the scored layer is kink: standardizing each neuron to zero mean and unit variance leaves no pre-activation with a persistent sign, and normalizing the branch input keeps the residual stream well enough conditioned to do the same. The cold prefix collapses to about $2\%$ of the width in both cases. Layer normalization sits in between, weakening the dead and always-on populations to $60/66$ without erasing them.
+Thus, although ReLU creates clean always-off and always-on regions, GELU and SiLU produce neither. What changes instead is the scale: GELU and SiLU attenuates per layer, so their typical activation approaches zero by depth 32, while ReLU holds its scale. This distinction matters methodologically as well as mechanistically. Any diagnostic that classifies neurons by an ill-chosen absolute magnitude cutoff could report an entire SiLU layer as dead once the decaying scale passes that cutoff, which is a property of the threshold and not of the network; see \cref{fig:activation-function-regimes}. This suggests that if we apply the same initialization set up as this current study, an all-zero estimator could be a strong baseline for a very deep network.
 
-RMS normalization is a special case worth stating exactly, because it changes nothing at all. RMSNorm rescales each sample by a positive scalar, and $\relu$ is positively homogeneous, so by induction over depth the sign pattern of every pre-activation is identical to the plain network's. Empirically the dead and always-on masks are bit-identical and the largest firing-rate discrepancy is $5\times10^{-5}$, exactly one sample in $20{,}000$ --- a float32 tie at zero. LayerNorm subtracts a mean and is therefore not positively homogeneous, which is precisely why it does move the regimes. Any normalization of this family is free for the estimator: it can be folded into the weights and ignored.
+Similar to ReLU networks, the correlation matrices of the activations in GELU and SiLU networks also collapse onto a very correlated core, but the ReLU network is the only one that does so with the exact dead/on identities that the estimator exploits. The smooth activations do not produce the same hard regimes, and therefore the estimator's assumptions do not hold for them. We think a mechanistic method exploiting the low rank of the activations could be an interesting direction, but we haven't found a method that achieves higher accuracy than sampling.
 
-The residual row is the one that needs a caveat rather than a headline. The unnormalized block $x + \relu(Wx)$ appears to be the best case of all --- rank $1.0$, only five kink neurons at the scored layer, and $100\%$ of its zeros inside the cold prefix --- but its residual stream reaches an RMS of $1.5\times10^{7}$ by depth 32, so the collapse is a symptom of unchecked variance growth rather than of the skip connection. Rescaling the branch, as SkipInit, Fixup, and the stable-ResNet $1/\sqrt{L}$ scaling do, separates the two: at $1/\sqrt{L}$ the stack returns to $83/98/75$ with effective rank $9.5$, essentially the plain network, and at branch scale $0.1$ it goes to $22/217/17$ with rank $68.9$. Residual \emph{topology} does not help the estimator; unnormalized residual \emph{growth} does, and no trained network is left in that state.
-
-Two things generalize from this. First, the amount of zero mass is not what varies. Every architecture here leaves $47$--$50\%$ of the scored activation matrix at exactly zero; what varies by a factor of thirty is how much of that zero mass lands in a contiguous cold prefix that can be skipped without gathering ($91\%$ of the zeros for the plain stack, $87\%$ under LayerNorm, but $3.0\%$ under BatchNorm and $2.2\%$ under the pre-norm residual). Sparsity is architecture-invariant; its \emph{exploitability} is not, and the packed-prefix machinery is what converts one into the other. Second, effective rank organizes most but not all of the picture, and putting the two ablations on one pair of axes (\cref{fig:rank-collapse}) shows how unequal they are. Across the nonlinearities the scored-layer effective rank spans only $1.4$ to $4.1$; across the architectures it spans $1.0$ for the residual stack, $2.2$ plain, $9.4$ under BatchNorm, and $94.8$ under the pre-norm residual --- roughly two orders of magnitude --- and the exploitable fraction tracks it across those four. RMSNorm is the counterexample that keeps this from being a law: it lifts effective rank from $2.2$ to $10.9$ while leaving every regime label unchanged, because rank is a statement about magnitudes and the classification is a statement about signs. Between the two ablations, then, it is the architecture and not the activation function that decides whether there is anything for the estimator to exploit.
-
-Placing both ablations on one scale (\cref{tab:polarization,tab:degeneracy-axes}) sharpens what "degeneracy" is doing here, because it turns out to name three separable things that no variant optimizes together. \Cref{tab:polarization} takes the estimator's own view: what fraction of neurons is polarized enough to decide analytically. ReLU leaves only $10\%$ of neurons in the ambiguous middle band, and the residual stack none at all, whereas GELU and SiLU leave roughly two thirds there and BatchNorm and the pre-norm residual leave all of them. \Cref{tab:degeneracy-axes} then splits degeneracy into hard structure, scale stability, and rank retention, and the three do not move together. SiLU retains the most rank of the activations ($4.10$) but at a scale that decays by $\times 0.72$ per layer, so by depth 32 its typical activation is $4.6\times10^{-5}$; GELU holds a workable scale but collapses to effective rank $1.43$, the lowest of any variant we ran; the unnormalized residual stack does the reverse, growing at $\times 1.67$ per layer into rank $1.00$. What matters for the estimator is none of these directly --- it is the first two columns, and only the ReLU family has them at all. GELU and SiLU produce exactly zero exact zeros and zero decided-sign neurons, so there is nothing to prune or fold no matter how the rank and scale behave.
-
-The unifying reading is that what the estimator exploits is degeneracy of one specific kind --- neurons whose sign is decided before the input is seen, and a representation that has collapsed onto few enough directions to make that common. Normalization is engineered specifically to prevent degeneracy, which is why it is also what disables the method. The practical consequence is that the compute savings reported here should be expected to be largest on exactly the networks that are worst conditioned, and to shrink toward the plain-sampling baseline on well-normalized ones. That is a real limitation of scope, but it is a legible one: the diagonal Gaussian pass measures the dead and always-on populations directly and cheaply, so a deployed estimator can detect that it is in the unfavorable regime before committing to a plan, and fall back rather than fail.
-
-\begin{table}[t]
+\begin{table}[hbt!]
 	\centering
-	\caption{Architecture ablation on matched He-Gaussian weights (width 256, depth 32). Regime counts, effective rank, and share of the zero mass that the packed-prefix rule can skip are all measured at the scored final layer; the cold-prefix column is the mean over depth of the prefix width as a fraction of the layer width. BatchNorm and the pre-norm residual block leave nothing to classify.}
-	\label{tab:architecture-ablation}
-	\begin{tabular}{lrrrrrr}
+	\small
+	\caption{The six wirings, written out. For one input, $x \in \R^{n}$ is the layer input, $W$ its weight matrix, $z = Wx \in \R^{n}$ the pre-activation, $n = 256$ the width, and $\varepsilon = 10^{-5}$. No normalizer carries a learned affine ($\gamma = 1$, $\beta = 0$), so each row differs from \emph{plain} only by its normalizer. $\mu_i$ and $\sigma_i$ are the mean and standard deviation of neuron $i$'s pre-activation \emph{over the input population}, estimated once and then held fixed, which is what makes inference-time BatchNorm a per-neuron affine; $\bar z = \frac1n\sum_j z_j$ and $s_z$ are the mean and standard deviation of the $n$ coordinates of $z$ \emph{within a single input}. The last column is what the estimator actually depends on: whether the normalizer can change which side of the kink a pre-activation falls on.}
+	\label{tab:architecture-definitions}
+	\begin{tabular}{llll}
 		\toprule
-		& \multicolumn{3}{c}{Final-layer regimes} & & & \\
-		\cmidrule(lr){2-4}
-		Architecture & dead & kink & on & Eff.\ rank & Cold prefix & Zeros skippable \\
+		Variant & Layer update & Normalizer $N(z)$ & Effect on $\operatorname{sign}(z)$ \\
 		\midrule
-		plain $\relu(Wx)$          &  73 & 106 &  77 &  2.2 & 35.3\% &  91.1\% \\
-		residual                   & 117 &   5 & 134 &  1.0 & 42.4\% & 100.0\% \\
-		BatchNorm                  &   0 & 256 &   0 &  9.4 &  2.1\% &   3.0\% \\
-		LayerNorm                  &  60 & 130 &  66 & 11.4 & 34.6\% &  86.7\% \\
-		RMSNorm                    &  73 & 106 &  77 & 10.9 & 35.3\% &  91.1\% \\
-		pre-norm residual          &   0 & 256 &   0 & 94.8 &  2.0\% &   2.2\% \\
+		plain             & $x \mapsto \relu(Wx)$                       & ---                                                              & --- \\
+		\hline\\
+		residual \citep{he2016identity} & $x \mapsto x + \relu(Wx)$                   & ---                                                              & --- \\
+		\hline\\
+		BatchNorm \citep{ioffe2015batch} & $x \mapsto \relu(N(Wx))$                    & $\dfrac{z_i - \mu_i}{\sigma_i + \varepsilon}$                      & per-neuron shift \\
+		\hline\\
+		LayerNorm \citep{ba2016layer} & $x \mapsto \relu(N(Wx))$                    & $\dfrac{z - \bar z \mathbf{1}}{s_z + \varepsilon}$                 & per-input shift \\
+		\hline\\
+		RMSNorm \citep{zhang2019root}   & $x \mapsto \relu(N(Wx))$                    & $\dfrac{z}{\sqrt{\frac1n \sum_j z_j^2} + \varepsilon}$             & none (positive scale) \\
+		\hline\\
+		pre-norm residual & $x \mapsto x + \relu(W\,\mathrm{LN}(x))$    & LN, applied to the branch input                                    & per-input shift, upstream \\
 		\bottomrule
 	\end{tabular}
 \end{table}
 
-\begin{table}[t]
-	\centering
-	\caption{Firing-rate polarization at the scored layer, across both ablations. A neuron that almost never or almost always fires is one the estimator can decide analytically; a neuron in the middle band has to be sampled. ReLU and the plain stack are the same network, so their rows agree. BatchNorm and the pre-norm residual block put \emph{every} neuron in the middle band, and the smooth activations put roughly two thirds there.}
-	\label{tab:polarization}
-	\begin{tabular}{llrrr}
-		\toprule
-		Ablation & Variant & rate $<0.05$ & rate $>0.95$ & rate in $[0.2, 0.8]$ \\
-		\midrule
-		\multirow{3}{*}{activation}   & ReLU        & 40\% & 41\% &  10\% \\
-		                              & GELU        &  3\% &  4\% &  64\% \\
-		                              & SiLU        &  2\% &  2\% &  63\% \\
-		\midrule
-		\multirow{6}{*}{architecture} & plain       & 40\% & 41\% &  10\% \\
-		                              & residual    & 46\% & 52\% &   0\% \\
-		                              & BatchNorm   &  0\% &  0\% & 100\% \\
-		                              & LayerNorm   & 38\% & 38\% &  14\% \\
-		                              & RMSNorm     & 40\% & 41\% &  10\% \\
-		                              & pre-norm residual & 0\% & 0\% & 100\% \\
-		\bottomrule
-	\end{tabular}
-\end{table}
+\subsection{Architectural Tweaks}
 
-\begin{table}[t]
-	\centering
-	\caption{Three things that all get called degeneracy, measured at the scored layer, and which no variant optimizes together. \emph{Decided sign} counts neurons whose pre-activation never changes sign, which is comparable across activation functions because it is a property of the pre-activation rather than of the nonlinearity. \emph{Exact zeros} is the share of the scored matrix that is literally zero. \emph{Scale ratio} is the median layer-to-layer ratio of the typical activation magnitude $\overline{|a|}$: $1$ is scale-preserving, below $1$ decays, above $1$ grows. Only the first two columns are exploitable, and only ReLU-family activations have them at all.}
-	\label{tab:degeneracy-axes}
-	\begin{tabular}{llrrrr}
-		\toprule
-		& & \multicolumn{2}{c}{hard exploitable structure} & scale stability & rank retention \\
-		\cmidrule(lr){3-4}\cmidrule(lr){5-5}\cmidrule(lr){6-6}
-		Ablation & Variant & decided sign & exact zeros & scale ratio & eff.\ rank \\
-		\midrule
-		\multirow{3}{*}{activation}   & ReLU        & 150/256 & 49.6\% & 0.990 &  2.16 \\
-		                              & GELU        &   0/256 &  0.0\% & 0.875 &  1.43 \\
-		                              & SiLU        &   0/256 &  0.0\% & 0.722 &  4.10 \\
-		\midrule
-		\multirow{6}{*}{architecture} & plain       & 150/256 & 49.6\% & 0.990 &  2.16 \\
-		                              & residual    & 251/256 & 47.2\% & 1.671 &  1.00 \\
-		                              & BatchNorm   &   0/256 & 49.7\% & 0.995 &  9.36 \\
-		                              & LayerNorm   & 126/256 & 49.9\% & 0.972 & 11.43 \\
-		                              & RMSNorm     & 150/256 & 49.6\% & 0.976 & 10.88 \\
-		                              & pre-norm residual & 0/256 & 50.1\% & 1.002 & 94.81 \\
-		\bottomrule
-	\end{tabular}
-\end{table}
+The second ablation varies the \emph{architecture}. \Cref{fig:architecture-regimes,fig:architecture-covariance}, summarized in \cref{tab:architecture-ablation}, compare six wirings on the same weight tensors and ReLU activation function: plain $\relu(Wx)$, a residual block $x + \relu(Wx)$, batch, layer, and root mean square (RMS) normalization applied to the pre-activation, and a pre-norm residual block $x + \relu(W\,\mathrm{LN}(x))$. BatchNorm is used in its inference-time form, a fixed per-neuron affine calibrated from population statistics. \Cref{tab:architecture-definitions} writes out all six.
 
-\begin{figure}[p]
+\begin{figure}[hbt!]
 	\centering
 	\includegraphics[width=\linewidth]{figures/architecture_neuron_maps.png}
 	\caption{The same two threshold-free views for the six architectures, directly comparable to \cref{fig:activation-function-regimes}. Grey in the right panel marks neurons that must be sampled; red and green mark the dead and always-on populations the estimator prunes and folds. BatchNorm and the pre-norm residual block are flat in \emph{both} panels --- uniform scale and uniform grey at every depth --- which is the visual form of an architecture that leaves nothing to classify. The unnormalized residual stack saturates the magnitude ramp, its median activation reaching $8.0\times10^{6}$ by depth 32.}
 	\label{fig:architecture-regimes}
 \end{figure}
 
-\begin{figure}[p]
+As shown in \cref{fig: architecture-regimes}, the estimator's assumptions survive some of these architectural tweaks but not others. Residual reinforces the classification, because the skip connection preserves the sign of the pre-activation and therefore the dead and always-on populations. RMS preserves the classification, because it rescales the pre-activation by a positive scalar and therefore cannot move a neuron from one side of the kink to the other. LayerNorm preserves the classification in expectation, but shifts the pre-activation by a per-input amount that can move a neuron from one side of the kink to the other. On the other hand, BatchNorm and pre-norm residual destroy the classification, thus collapsing the estimator's assumptions.
+
+\begin{table}[hbt!]
+	\centering
+	\caption{Architecture ablation on matched He-Gaussian weights (width 256, depth 32). Regime counts and effective rank are all measured at the scored final layer; the cold-prefix column is the mean over depth of the prefix width as a fraction of the layer width. BatchNorm and the pre-norm residual block leave nothing to classify.}
+	\label{tab:architecture-ablation}
+	\begin{tabular}{lrrrrrr}
+		\toprule
+		& \multicolumn{3}{c}{Final-layer regimes} & & & \\
+		\cmidrule(lr){2-4}
+		Architecture & dead & kink & on & Eff.\ rank & Cold prefix \\
+		\midrule
+		plain $\relu(Wx)$          &  73 & 106 &  77 &  2.2 & 35.3\% \\
+		residual                   & 117 &   5 & 134 &  1.0 & 42.4\% \\
+		BatchNorm                  &   0 & 256 &   0 &  9.4 &  2.1\% \\
+		LayerNorm                  &  60 & 130 &  66 & 11.4 & 34.6\% \\
+		RMSNorm                    &  73 & 106 &  77 & 10.9 & 35.3\% \\
+		pre-norm residual          &   0 & 256 &   0 & 94.8 &  2.0\% \\
+		\bottomrule
+	\end{tabular}
+\end{table}
+
+In our error analysis in \cref{sec:results}, we saw that the estimator's error is dominated by the on neurons, with RMSNorm, we expect the exact magnitude of the errors to shrink according to the rescaling. For residual connections, we expect the classification step in the estimator to be more accurate, and therefore the error to shrink as well. For layer normalization, it might take a more sophisticated estimator to identify the per-input shift and correct for it. For BatchNorm and pre-norm residual, the estimator's assumptions are violated, and the estimator reduces to plain sampling. These intuitions are confirmed in \cref{tab:architecture-ablation,fig:rank-collapse}, which show that the estimator's classification survive residual and RMSNorm, are partially violated by LayerNorm, and are completely destroyed by BatchNorm and pre-norm residual.
+
+\begin{figure}[hbt!]
 	\centering
 	\includegraphics[width=\linewidth]{figures/architecture_covariance_comparison.png}
 	\caption{Activation correlation matrices for the six architectures, the same view as \cref{fig:activation-function-covariance}, columns ordered by mean absolute correlation with the rest of the layer and annotated with effective rank. The residual stack concentrates into a single saturated correlated core by L16; BatchNorm develops a weaker late core; the pre-norm residual block stays near-diagonal to depth 32, which is the visual form of a representation that never collapses.}
 	\label{fig:architecture-covariance}
 \end{figure}
 
-\begin{figure}[tbp]
+These different architectures also produce varying effective ranks of the activation covariance, which is a more quantitative measure of the collapse of the representation, as shown in different views in \cref{tab:architecture-ablation,fig:rank-collapse,fig:architecture-covariance}. As seen in \cref{fig:architecture-covariance}, the residual collapses the most to a near rank-one representation, which might be attributed to the sub-optimality in He-initialization for residual blocks \citep{yang2017mean}. BatchNorm and LayerNorm are in between, with BatchNorm collapsing more than LayerNorm. RMSNorm is an exception: it raises effective rank without changing a single regime label, since it rescales magnitudes but cannot move signs. Pre-norm residual block maintains a near-full-rank representation, which is consistent with its popularity in modern architectures \citep{radford2019language, xiong2020layer}.
+
+Across layers, as shown in \cref{fig:rank-collapse}, we see the effective rank decreases the fastest for the residual stack, followed by the plain ReLU network. Interestingly, RMSNorm's effective rank decreases at the same rate as layer normalization, instead of trailing the plain ReLU network. Although batch normalization initially show a slower decay, it eventually matches the RMSNorm and layer normalization. \citet{daneshmand2020batch} prove that batch
+normalization provably avoids rank collapse in randomly initialized deep networks, so we don't expect the effective rank to continue to decay in deeper networks. 
+
+The pre-norm residual block maintains a near-full-rank representation across all layers, which is consistent with the visualizations in \cref{fig:architecture-covariance}, and might be the most difficult to develop a mechanistic estimator that attempts to exploit the low-rank structure of the representation.
+
+\begin{figure}[hbt!]
 	\centering
 	\includegraphics[width=\linewidth]{figures/rank_collapse_comparison.png}
 	\caption{Effective rank of the activation covariance versus depth for both ablations on shared axes. Changing the nonlinearity moves the scored-layer rank only between $1.4$ and $4.1$; changing the architecture moves it from $1.0$ to $94.8$. The plain and residual stacks collapse toward rank one, which is what creates the hard regimes; normalization slows the collapse and the pre-norm residual block halts it. RMSNorm is the exception to the correspondence: it raises effective rank without changing a single regime label, since it rescales magnitudes but cannot move signs.}
 	\label{fig:rank-collapse}
 \end{figure}
-
-For the purposes of the challenge, the result shows that white-box structure can substantially improve the compute-accuracy tradeoff over plain sampling. For the broader mechanistic-estimation agenda, the lesson is narrower but encouraging: even a simple Gaussian regime classifier can turn a random MLP into a smaller estimation problem whose remaining uncertainty is localized and measurable.
 
 \clearpage

@@ -1,4 +1,5 @@
 \section{Method: A Structure-Aware Hybrid Estimator}
+\label{sec:method}
 
 \subsection{Classifying Every Neuron as Dead, Kink, or On Before Any Sampling}
 
@@ -50,7 +51,7 @@ The regime model determines which sampled coordinates are materialized. Dead neu
 \end{align}
 Its contribution to a layer-31 preactivation can therefore be composed through $W_{30}$ and $W_{31}$ without materializing the sampled layer-30 column. Layer-30 kink neurons do not satisfy this identity, so their contribution remains sampled.
 
-One disadvantage of using a classifier is that the boundary between regimes is not always clear. To overcome this shortcoming, a small prefix sample is used to identify neurons near the decision boundary, which are reevaluated using a larger prefix sample before being reassigned if necessary. This verification is particularly important in layers 30 and 31, where classification errors directly affect the scored layer.
+One disadvantage of using a classifier is that the boundary between regimes is not always clear. To overcome this shortcoming, a small set of samples is used to reclassify neurons near the decision boundary, which we call the "pilot pass," and will come back to in the next subsection. This verification is particularly important in layers 30 and 31, where classification errors directly affect the scored layer.
 
 \subsection{Matrix Multiplication for Sampled Activations}
 
@@ -61,7 +62,7 @@ One disadvantage of using a classifier is that the boundary between regimes is n
     \label{fig:prefixpack-blocks}
 \end{figure}
 
-The classification of neurons as dead, kink, or on improves efficiency primarily by removing the computation for dead neurons, but the sampled activations of the surviving neurons still contain many zeros. To see where they are, we sort the columns of the sampled post-ReLU activation matrix by firing rate, the fraction of Monte Carlo samples on which each neuron is active. \Cref{fig:prefixpack-blocks} shows the results across three networks and three depths. On the left side of the matrix, the usually inactive (``cold'') columns are mostly zero, with only scattered firings, while usually active (``hot'') columns to the right are dense. After the coldest-first sort, a typical row carries only two or three nonzeros across the leading columns (the ``prefix''). The estimator therefore splits the multiplication into two regions. The dense portion is evaluated with Strassen matrix multiplication, while the prefix of cold columns is processed row by row, gathering only the few active entries in each row.
+The classification of neurons as dead, kink, or on improves efficiency primarily by removing the computation for dead neurons, but the sampled activations of the surviving neurons still contain many zeros. To see where they are, we sort the columns of the sampled post-ReLU activation matrix by firing rate, the fraction of Monte Carlo samples on which each neuron is active. \Cref{fig:prefixpack-blocks} shows the results across three networks and three depths. On the left side of the matrix, the usually inactive (``cold'') columns are mostly zero, with only scattered firings, while usually active (``hot'') columns to the right are dense. After the coldest-first sort, a typical row carries only two or three nonzeros across the leading columns (the ``prefix''). The estimator therefore splits the multiplication into two regions. The dense portion is evaluated with Strassen matrix multiplication \citep{strassen1969gaussian}, while the prefix of cold columns is processed row by row, gathering only the few active entries in each row.
 
 \subsubsection{Evaluating the Cold-Region Contribution}
 
@@ -76,16 +77,16 @@ To improve efficiency, we apply the same general techniques for matrix multiplic
 
 \subsection{Sampling: Antithetic Scrambled \sobol{} Points at a Fixed Budget}
 
-For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithetic pairing. The \sobol{} sequence is a standard low-discrepancy variance-reduction ingredient \citep{sobol1967distribution}. The antithetic pair uses the Gaussian symmetry $z\mapsto -z$ to encourage cancellation between paired Monte Carlo evaluations \citep[Section~8.2]{owen2013montecarlo}. Related randomized-QMC approaches were also discussed by other challenge participants, including randomized lattice/Sobol comparisons and Rao-Blackwellization for post-ReLU activation means \citep{aicrowdRqmcRaoBlackwell2026}, and variance-bias budgeting for deep white-box mean estimation \citep{aicrowdVarianceBiasBudget2026}. 
+For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithetic pairing. The \sobol{} sequence is a standard low-discrepancy variance-reduction ingredient \citep{sobol1967distribution}. The antithetic pair uses the Gaussian symmetry $z\mapsto -z$ to encourage cancellation of the ``odd'' part of the integration \citep[Section~8.2]{owen2013montecarlo}. Related randomized-QMC approaches were also discussed by other challenge participants, including randomized lattice/Sobol comparisons and Rao-Blackwellization for post-ReLU activation means \citep{aicrowdRqmcRaoBlackwell2026}, and variance-bias budgeting for deep white-box mean estimation \citep{aicrowdVarianceBiasBudget2026}. 
 
-Only half of the Gaussianized points are stored; the first-layer symmetry reconstructs the paired activations exactly after the first matmul. The submitted estimator uses a fixed $84{,}992$ effective samples for every MLP. The pilot stages read the leading $2.5\%$ and $20\%$ of the same \sobol{} prefix that the main pass consumes, so every probe sample is reused and classification costs no extra draws. We previously allocated between $30{,}720$ and $61{,}440$ samples per MLP based on a difficulty proxy, but the rule did not transfer to the hidden evaluation networks, so the submitted estimator keeps the budget fixed.
+Only half of the Gaussianized points are stored; the first-layer symmetry reconstructs the paired activations exactly after the first matmul. The submitted estimator uses a fixed $84{,}992$ effective samples for every MLP. The pilot stages read the leading $2.5\%$ and $20\%$ of the same \sobol{} prefix that the main pass consumes, so every probe sample is reused and classification costs no extra draws. 
 
 \subsection{Full Specification of the Submitted Algorithm}
 \label{sec:complete-algorithm}
 
 This subsection provides additional detail about the implementation. 
 
-\paragraph{Sampling artifact.} A file \texttt{sobol\_points.npz} ships with the submission. It holds one float32 array \texttt{points} of shape $(42{,}496,\,256)$: the first $42{,}496$ points of a scrambled \sobol{} sequence in dimension 256 (SciPy \texttt{qmc.Sobol} with \texttt{scramble=True} and seed $5$), mapped through the standard normal inverse CDF. These are \emph{half}-samples: a block of $N$ effective samples is built as $x = [P;\,-P]$ from $N/2$ consecutive stored rows. The pilot block uses stored rows $0$--$5{,}119$ ($N_0 = 10{,}240$ effective samples); the continuation block uses rows $5{,}120$--$42{,}495$ ($N_1 = 74{,}752$); together $N = 84{,}992$. The scramble realization depends on the SciPy version: the shipped file is reproduced byte-for-byte by \texttt{scripts/generate\_sobol\_points\_84992\_seed5.py} in the repository under SciPy 1.15.3.
+\paragraph{Sampling artifact.} A file \texttt{sobol\_points.npz} ships with the submission. It holds one float32 array \texttt{points} of shape $(42{,}496,\,256)$: the first $42{,}496$ points of a scrambled \sobol{} sequence in dimension 256 (SciPy \texttt{qmc.Sobol} with \texttt{scramble=True} and seed $5$), mapped through the standard normal inverse CDF. These are \emph{half}-samples: a block of $N$ effective samples is built as $x = [P;\,-P]$ from $N/2$ consecutive stored rows. The pilot block uses stored rows $0$--$5{,}119$ ($N_0 = 10{,}240$ effective samples); the continuation block uses rows $5{,}120$--$42{,}495$ ($N_1 = 74{,}752$); together $N = 84{,}992$. 
 
 \begin{table}[t]
 \centering
@@ -116,7 +117,7 @@ Strassen & dim $\ge 96$, rows $\ge 4096$, depth $\le 1$ & guard for the two-leve
 \label{tab:hyperparams}
 \end{table}
 
-\paragraph{Probe estimates.} A probe checks a set of candidate neurons $C$ at layer $\ell$ using a small prefix of the current samples. It takes the first $r$ rows of each antithetic half ($r = \max(2, \lfloor f N \rfloor)$ for a block of $N$ samples, so rows $0..r{-}1$ and $N/2..N/2{+}r{-}1$), multiplies them by $W_\ell[A_{\ell-1}, C]$, and estimates each candidate's margin as $\hat\alpha_j = \widehat{\mu}_j / \max(\widehat{\sigma}_j, 10^{-6})$ from the empirical mean and standard deviation over those $2r$ rows. To decide against a threshold $\theta$, the estimator first classifies with the cheap $f_{\rm pilot}$ probe; any candidate that lands within $\delta$ of the threshold is considered too close to call and is re-probed with the larger $f_{\rm recheck}$ prefix, whose verdict is final.
+\paragraph{Pilot pass.} The pilot pass checks a set of candidate neurons $C$ at layer $\ell$ using a small set of samples. It takes the first $r$ rows of each antithetic half ($r = \max(2, \lfloor f N \rfloor)$ for a block of $N$ samples, so rows $0..r{-}1$ and $N/2..N/2{+}r{-}1$), multiplies them by $W_\ell[A_{\ell-1}, C]$, and estimates each candidate's margin as $\hat\alpha_j = \widehat{\mu}_j / \max(\widehat{\sigma}_j, 10^{-6})$ from the empirical mean and standard deviation over those $2r$ rows. To decide against a threshold $\theta$, the estimator first classifies with the cheap $f_{\rm pilot}$ probe; any candidate that lands within $\delta$ of the threshold is considered too close to call and is re-probed with the larger $f_{\rm recheck}$ prefix, whose verdict is final.
 
 \begin{algorithm}[p]
 \caption{Submitted estimator (submission \submissionid): \texttt{predict(mlp)}}

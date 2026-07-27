@@ -1,4 +1,5 @@
 \section{Discussion}
+\label{sec:discussion}
 
 \begin{figure}[hbt!]
 	\centering
@@ -67,6 +68,7 @@ Similar to ReLU networks, the correlation matrices of the activations in GELU an
 \end{table}
 
 \subsection{Architectural Tweaks}
+\label{sec:architecture-ablation}
 
 The second ablation varies the \emph{architecture}. \Cref{fig:architecture-regimes,fig:architecture-covariance}, summarized in \cref{tab:architecture-ablation}, compare six wirings on the same weight tensors and ReLU activation function: plain $\relu(Wx)$, a residual block $x + \relu(Wx)$, batch, layer, and root mean square (RMS) normalization applied to the pre-activation, and a pre-norm residual block $x + \relu(W\,\mathrm{LN}(x))$. BatchNorm is used in its inference-time form, a fixed per-neuron affine calibrated from population statistics. \Cref{tab:architecture-definitions} writes out all six.
 
@@ -77,7 +79,7 @@ The second ablation varies the \emph{architecture}. \Cref{fig:architecture-regim
 	\label{fig:architecture-regimes}
 \end{figure}
 
-As shown in \cref{fig: architecture-regimes}, the estimator's assumptions survive some of these architectural tweaks but not others. Residual reinforces the classification, because the skip connection preserves the sign of the pre-activation and therefore the dead and always-on populations. RMS preserves the classification, because it rescales the pre-activation by a positive scalar and therefore cannot move a neuron from one side of the kink to the other. LayerNorm preserves the classification in expectation, but shifts the pre-activation by a per-input amount that can move a neuron from one side of the kink to the other. On the other hand, BatchNorm and pre-norm residual destroy the classification, thus collapsing the estimator's assumptions.
+As shown in \cref{fig:architecture-regimes}, the estimator's assumptions survive some of these architectural tweaks but not others. Residual reinforces the classification, because the skip connection preserves the sign of the pre-activation and therefore the dead and always-on populations. RMS preserves the classification, because it rescales the pre-activation by a positive scalar and therefore cannot move a neuron from one side of the kink to the other. LayerNorm preserves the classification in expectation, but shifts the pre-activation by a per-input amount that can move a neuron from one side of the kink to the other. On the other hand, BatchNorm and pre-norm residual destroy the classification, thus collapsing the estimator's assumptions.
 
 \begin{table}[hbt!]
 	\centering

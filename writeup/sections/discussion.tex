@@ -39,30 +39,30 @@ The first ablation varies the \emph{nonlinearity}. \Cref{fig:activation-function
 	\label{fig:activation-function-covariance}
 \end{figure}
 
-Thus, although ReLU creates clean always-off and always-on regions, GELU and SiLU produce neither. What changes instead is the scale: GELU and SiLU attenuates per layer, so their typical activation approaches zero by depth 32, while ReLU holds its scale. This distinction matters methodologically as well as mechanistically. Any diagnostic that classifies neurons by an ill-chosen absolute magnitude cutoff could report an entire SiLU layer as dead once the decaying scale passes that cutoff, which is a property of the threshold and not of the network; see \cref{fig:activation-function-regimes}. This suggests that if we apply the same initialization set up as this current study, an all-zero estimator could be a strong baseline for a very deep network.
+Thus, although ReLU creates clean always-off and always-on regions, GELU and SiLU produce neither. Instead, under the initialization studied here, their activations gradually shrink with depth, so that by layer 32, the typical activation magnitude is close to zero even though neurons remain responsive to their inputs. This distinction is important when designing diagnostics. A method that declares neurons ``dead'' whenever their activation falls below a fixed absolute threshold could incorrectly label an entire deep SiLU layer as dead simply because the overall activation scale has decayed, which is a property of the threshold and not of the network; see \cref{fig:activation-function-regimes}.
 
-Similar to ReLU networks, the correlation matrices of the activations in GELU and SiLU networks also collapse onto a very correlated core, but the ReLU network is the only one that does so with the exact dead/on identities that the estimator exploits. The smooth activations do not produce the same hard regimes, and therefore the estimator's assumptions do not hold for them. We think a mechanistic method exploiting the low rank of the activations could be an interesting direction, but we haven't found a method that achieves higher accuracy than sampling.
+Similar to ReLU networks, the correlation matrices of the activations in GELU and SiLU networks collapse onto a very correlated core, but the ReLU network is the only one that does so with the exact dead/on identities that the estimator exploits. The smooth activations do not produce the same hard regimes, and therefore the estimator's assumptions do not hold for them. We think a mechanistic method exploiting the low rank of the activations could be an interesting direction, but we haven't found a method that achieves higher accuracy than sampling.
 
 \begin{table}[hbt!]
 	\centering
 	\small
-	\caption{The six wirings, written out. For one input, $x \in \R^{n}$ is the layer input, $W$ its weight matrix, $z = Wx \in \R^{n}$ the pre-activation, $n = 256$ the width, and $\varepsilon = 10^{-5}$. No normalizer carries a learned affine ($\gamma = 1$, $\beta = 0$), so each row differs from \emph{plain} only by its normalizer. $\mu_i$ and $\sigma_i$ are the mean and standard deviation of neuron $i$'s pre-activation \emph{over the input population}, estimated once and then held fixed, which is what makes inference-time BatchNorm a per-neuron affine; $\bar z = \frac1n\sum_j z_j$ and $s_z$ are the mean and standard deviation of the $n$ coordinates of $z$ \emph{within a single input}. The last column is what the estimator actually depends on: whether the normalizer can change which side of the kink a pre-activation falls on.}
+	\caption{The six wirings, written out. For one input, $x \in \R^{d}$ is the layer input (a row vector, as in the rest of the paper), $W$ its weight matrix, $z = xW \in \R^{d}$ the pre-activation, $d = 256$ the width, and $\varepsilon = 10^{-5}$. No normalizer carries a learned affine ($\gamma = 1$, $\beta = 0$), so each row differs from \emph{plain} only by its normalizer. $\mu_i$ and $\sigma_i$ are the mean and standard deviation of neuron $i$'s pre-activation \emph{over the input population}, estimated once and then held fixed, which is what makes inference-time BatchNorm a per-neuron affine; $\bar z = \frac1d\sum_j z_j$ and $s_z$ are the mean and standard deviation of the $d$ coordinates of $z$ \emph{within a single input}. The last column is what the estimator actually depends on: whether the normalizer can change which side of the kink a pre-activation falls on.}
 	\label{tab:architecture-definitions}
 	\begin{tabular}{llll}
 		\toprule
 		Variant & Layer update & Normalizer $N(z)$ & Effect on $\operatorname{sign}(z)$ \\
 		\midrule
-		plain             & $x \mapsto \relu(Wx)$                       & ---                                                              & --- \\
+		plain             & $x \mapsto \relu(xW)$                       & ---                                                              & --- \\
 		\hline\\
-		residual \citep{he2016identity} & $x \mapsto x + \relu(Wx)$                   & ---                                                              & --- \\
+		residual \citep{he2016identity} & $x \mapsto x + \relu(xW)$                   & ---                                                              & --- \\
 		\hline\\
-		BatchNorm \citep{ioffe2015batch} & $x \mapsto \relu(N(Wx))$                    & $\dfrac{z_i - \mu_i}{\sigma_i + \varepsilon}$                      & per-neuron shift \\
+		BatchNorm \citep{ioffe2015batch} & $x \mapsto \relu(N(xW))$                    & $\dfrac{z_i - \mu_i}{\sigma_i + \varepsilon}$                      & per-neuron shift \\
 		\hline\\
-		LayerNorm \citep{ba2016layer} & $x \mapsto \relu(N(Wx))$                    & $\dfrac{z - \bar z \mathbf{1}}{s_z + \varepsilon}$                 & per-input shift \\
+		LayerNorm \citep{ba2016layer} & $x \mapsto \relu(N(xW))$                    & $\dfrac{z - \bar z \mathbf{1}}{s_z + \varepsilon}$                 & per-input shift \\
 		\hline\\
-		RMSNorm \citep{zhang2019root}   & $x \mapsto \relu(N(Wx))$                    & $\dfrac{z}{\sqrt{\frac1n \sum_j z_j^2} + \varepsilon}$             & none (positive scale) \\
+		RMSNorm \citep{zhang2019root}   & $x \mapsto \relu(N(xW))$                    & $\dfrac{z}{\sqrt{\frac1d \sum_j z_j^2} + \varepsilon}$             & none (positive scale) \\
 		\hline\\
-		pre-norm residual & $x \mapsto x + \relu(W\,\mathrm{LN}(x))$    & LN, applied to the branch input                                    & per-input shift, upstream \\
+		pre-norm residual & $x \mapsto x + \relu(\mathrm{LN}(x)\,W)$    & LN, applied to the branch input                                    & per-input shift, upstream \\
 		\bottomrule
 	\end{tabular}
 \end{table}
@@ -70,7 +70,7 @@ Similar to ReLU networks, the correlation matrices of the activations in GELU an
 \subsection{Architectural Tweaks}
 \label{sec:architecture-ablation}
 
-The second ablation varies the \emph{architecture}. \Cref{fig:architecture-regimes,fig:architecture-covariance}, summarized in \cref{tab:architecture-ablation}, compare six wirings on the same weight tensors and ReLU activation function: plain $\relu(Wx)$, a residual block $x + \relu(Wx)$, batch, layer, and root mean square (RMS) normalization applied to the pre-activation, and a pre-norm residual block $x + \relu(W\,\mathrm{LN}(x))$. BatchNorm is used in its inference-time form, a fixed per-neuron affine calibrated from population statistics. \Cref{tab:architecture-definitions} writes out all six.
+The second ablation varies the \emph{architecture}. \Cref{fig:architecture-regimes,fig:architecture-covariance}, summarized in \cref{tab:architecture-ablation}, compare six wirings on the same weight tensors and ReLU activation function: plain $\relu(xW)$, a residual block $x + \relu(xW)$, batch, layer, and root mean square (RMS) normalization applied to the pre-activation, and a pre-norm residual block $x + \relu(\mathrm{LN}(x)\,W)$. BatchNorm is used in its inference-time form, a fixed per-neuron affine calibrated from population statistics. \Cref{tab:architecture-definitions} writes out all six.
 
 \begin{figure}[hbt!]
 	\centering
@@ -91,7 +91,7 @@ As shown in \cref{fig:architecture-regimes}, the estimator's assumptions survive
 		\cmidrule(lr){2-4}
 		Architecture & dead & kink & on & Eff.\ rank & Cold prefix \\
 		\midrule
-		plain $\relu(Wx)$          &  73 & 106 &  77 &  2.2 & 35.3\% \\
+		plain $\relu(xW)$          &  73 & 106 &  77 &  2.2 & 35.3\% \\
 		residual                   & 117 &   5 & 134 &  1.0 & 42.4\% \\
 		BatchNorm                  &   0 & 256 &   0 &  9.4 &  2.1\% \\
 		LayerNorm                  &  60 & 130 &  66 & 11.4 & 34.6\% \\

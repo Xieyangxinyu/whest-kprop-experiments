@@ -1,11 +1,14 @@
 \section{Problem Setup and Notation}
 
-We consider a fully connected feed-forward neural network (a multilayer perceptron, MLP) with ReLU activations and no bias terms. The network has \emph{depth} $L$, the number of layers, and \emph{width} $d$, the number of neurons in every layer; layer $\ell$ is parameterized by a weight matrix $W_\ell\in\R^{d\times d}$. Throughout we use row-vector notation: activations are row vectors that multiply the weight matrices from the left, matching the samples-as-rows layout of the implementation. The input $x_0\sim N(0,I_d)$ is a random row vector whose $d$ coordinates are independent standard Gaussians (mean $0$, variance $1$), and the layers compute
+We consider a fully connected feed-forward neural network (a multilayer perceptron, MLP) with ReLU activations and no bias terms. The network has \emph{depth} $L$ and \emph{width} $d$. The input does not count toward the depth. Each of the $L$ layers contains $d$ neurons, and the transformation from layer $\ell-1$ to layer $\ell$ is parameterized by a weight matrix $W_\ell\in\R^{d\times d}$. Throughout we use row-vector notation: activations are row vectors and multiply the weight matrices from the left, matching the layout of the implementation. The input $x_0\sim N(0,I_d)$ is a random row vector with $d$ independent standard Gaussian coordinates. The layers compute
 \begin{align}
     z_\ell &= x_{\ell-1} W_\ell \in \R^d, \\
     x_\ell &= \relu(z_\ell) \in \R^d, \qquad \ell=1,\ldots,L,
 \end{align}
-where $\relu(z)=\max(z,0)$ is applied elementwise; $z_\ell$ is called the \emph{pre-activation} and $x_\ell$ the (post-ReLU) \emph{activation} of layer $\ell$. In $W_\ell$, row $i$ holds the outgoing weights of input neuron $i$, and column $j$ holds the incoming weights of output neuron $j$: entry $W_{\ell,ij}$ is the weight from neuron $i$ of layer $\ell-1$ to neuron $j$ of layer $\ell$, so $z_{\ell,j}=\sum_i x_{\ell-1,i}\,W_{\ell,ij}$.
+where $\relu(z)=\max(z,0)$ is applied elementwise. We call $z_\ell$ the \emph{pre-activation} and $x_\ell$ the post-ReLU \emph{activation} of layer $\ell$. Entry $W_{\ell,ij}$ is the weight from neuron $i$ of layer $\ell-1$ to neuron $j$ of layer $\ell$. Thus
+\begin{align}
+    z_{\ell,j} = \sum_i x_{\ell-1,i}\,W_{\ell,ij}.
+\end{align}
 
 Given only the weights $W_1,\ldots,W_L$, the estimator must output the matrix of mean activations
 \begin{align}
@@ -14,8 +17,8 @@ Given only the weights $W_1,\ldots,W_L$, the estimator must output the matrix of
 \end{align}
 where the expectation is taken over the random input $x_0$.
 
-The challenge networks have depth $L=32$ and width $d=256$. Although all $L$ rows are reported, accuracy is scored only on the last-layer means: writing $\widehat m_L$ for the predicted final row, the score is the mean squared error
+The challenge networks have depth $L=32$ and width $d=256$. Accuracy is scored only on the last-layer means. Writing $\widehat m_L$ for the predicted final-layer mean, the score is the mean squared error
 \begin{align}
     \mse(\widehat m_L, m_L) = \frac{1}{d}\sum_{j=1}^{d}\left(\widehat m_{L,j} - m_{L,j}\right)^2,
 \end{align}
-multiplied by the compute penalty $\max(0.1,\, C/B)$, where $C$ is the compute the estimator consumed, measured in floating-point operations (FLOPs), and $B$ is the per-network FLOP budget; lower is better. The earlier rows $m_1,\ldots,m_{L-1}$ are diagnostics, so the estimation problem is, in effect, to approximate $m_L$ as accurately as possible within the compute budget.
+multiplied by the compute penalty $\max(0.1,\, C/B)$; lower is better. Here $C$ is the compute the estimator consumed, measured in floating-point operations (FLOPs), and $B$ is the per-network FLOP budget. The earlier rows are reported but serve only as diagnostics. In effect, the estimation problem is to approximate $m_L$ as accurately as possible within the compute budget.

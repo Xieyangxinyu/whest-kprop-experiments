@@ -45,20 +45,20 @@ In this estimator, we use the normalized margin $\alpha_{\ell,j}$ to classify a 
 
 \subsubsection{What the Classification Buys: Skip the Dead, Sample the Kinks, Fold the On}
 
-The regime model determines which sampled coordinates are materialized. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. Kink neurons remain sampled, because their ReLU masks change across samples. On neurons are treated as linear in later layers. If neuron $i$ is on at layer 30, then sample by sample
+The regime model determines which sampled coordinates are materialized. Dead neurons do not need a sampled matmul column: their post-ReLU mean is either filled by the analytic pass or set to zero when the residual contribution is negligible. Kink neurons remain sampled, because their ReLU masks change across samples. On neurons receive a linear treatment only in the last two layers, 31 and 32; in layers 1--30 they remain part of the sampled propagation alongside the kink neurons. If neuron $i$ is on at layer 31, then sample by sample
 \begin{align}
-    x_{30,i}=z_{30,i}=(x_{29}W_{30})_i.
+    x_{31,i}=z_{31,i}=(x_{30}W_{31})_i.
 \end{align}
-Its contribution to a layer-31 preactivation can therefore be composed through $W_{30}$ and $W_{31}$ without materializing the sampled layer-30 column. Layer-30 kink neurons do not satisfy this identity, so their contribution remains sampled.
+Its contribution to a layer-32 preactivation can therefore be composed through $W_{31}$ and $W_{32}$ without materializing the sampled layer-31 column, and the means of the on neurons at layer 32 are likewise computed linearly from the layer-31 mean activations. Kink neurons at layer 31 do not satisfy this identity, so their contribution remains sampled.
 
-One disadvantage of using a classifier is that the boundary between regimes is not always clear. To overcome this shortcoming, a small set of samples is used to reclassify neurons near the decision boundary, which we call the "pilot pass," and will come back to in the next subsection. This verification is particularly important in layers 30 and 31, where classification errors directly affect the scored layer.
+One disadvantage of using a classifier is that the boundary between regimes is not always clear. To overcome this shortcoming, a small set of samples is used to reclassify neurons near the decision boundary, which we call the ``pilot pass,'' and will come back to in the next subsection. This verification is particularly important in the last two layers, where classification errors directly affect the scored layer.
 
 \subsection{Matrix Multiplication for Sampled Activations}
 
 \begin{figure}[p]
     \centering
     \includegraphics[width=\linewidth]{figures/prefixpack_blocks.png}
-    \caption{The zero structure the packed prefix exploits, captured from the submitted estimator's own continuation blocks (74{,}752 sample rows $\times$ active columns). Rows of the grid are three public mini networks of increasing difficulty (nets 10, 70, 0); grid columns are layers 5, 15, and 27. Within each panel, matrix columns are sorted coldest-first, the dashed vertical line marks the prefix width $s$, and sample rows are shown in the estimator's actual bucket order: rows with no nonzero on the prefix first, then buckets of at most $1$, $2$, $4$, and $8$ nonzeros, then the dense tail. The outlined top-left rectangle---the zero bucket crossed with the prefix---is all zero, and the propagating matmul skips it outright; each bucket below it gathers at most its cap in columns instead of multiplying the whole prefix.}
+    \caption{The zero structure the packed prefix exploits, captured from the submitted estimator's own continuation blocks (74{,}752 sample rows $\times$ active columns). Rows of the grid are three public mini networks of increasing difficulty (nets 10, 70, 0); grid columns are layers 6, 16, and 28. Within each panel, matrix columns are sorted coldest-first, the dashed vertical line marks the prefix width $s$, and sample rows are shown in the estimator's actual bucket order: rows with no nonzero on the prefix first, then buckets of at most $1$, $2$, $4$, and $8$ nonzeros, then the dense tail. The outlined top-left rectangle---the zero bucket crossed with the prefix---is all zero, and the propagating matmul skips it outright; each bucket below it gathers at most its cap in columns instead of multiplying the whole prefix.}
     \label{fig:prefixpack-blocks}
 \end{figure}
 
@@ -80,77 +80,3 @@ To improve efficiency, we apply the same general techniques for matrix multiplic
 For sampled propagation, the estimator uses a fixed \sobol{} prefix and antithetic pairing. The \sobol{} sequence is a standard low-discrepancy variance-reduction ingredient \citep{sobol1967distribution}. The antithetic pair uses the Gaussian symmetry $z\mapsto -z$ to encourage cancellation of the ``odd'' part of the integration \citep[Section~8.2]{owen2013montecarlo}. Related randomized-QMC approaches were also discussed by other challenge participants, including randomized lattice/Sobol comparisons and Rao-Blackwellization for post-ReLU activation means \citep{aicrowdRqmcRaoBlackwell2026}, and variance-bias budgeting for deep white-box mean estimation \citep{aicrowdVarianceBiasBudget2026}. 
 
 Only half of the Gaussianized points are stored; the first-layer symmetry reconstructs the paired activations exactly after the first matmul. The submitted estimator uses a fixed $84{,}992$ effective samples for every MLP. The pilot stages read the leading $2.5\%$ and $20\%$ of the same \sobol{} prefix that the main pass consumes, so every probe sample is reused and classification costs no extra draws. 
-
-\subsection{Full Specification of the Submitted Algorithm}
-\label{sec:complete-algorithm}
-
-This subsection provides additional detail about the implementation. 
-
-\paragraph{Sampling artifact.} A file \texttt{sobol\_points.npz} ships with the submission. It holds one float32 array \texttt{points} of shape $(42{,}496,\,256)$: the first $42{,}496$ points of a scrambled \sobol{} sequence in dimension 256 (SciPy \texttt{qmc.Sobol} with \texttt{scramble=True} and seed $5$), mapped through the standard normal inverse CDF. These are \emph{half}-samples: a block of $N$ effective samples is built as $x = [P;\,-P]$ from $N/2$ consecutive stored rows. The pilot block uses stored rows $0$--$5{,}119$ ($N_0 = 10{,}240$ effective samples); the continuation block uses rows $5{,}120$--$42{,}495$ ($N_1 = 74{,}752$); together $N = 84{,}992$. 
-
-\begin{table}[t]
-\centering
-\small
-\begin{tabular}{@{}lll@{}}
-\toprule
-symbol & value & meaning \\
-\midrule
-$N_0$ / $N_1$ & $10{,}240$ / $74{,}752$ & pilot / continuation effective samples (antithetic) \\
-$\theta_{\rm dead}$ / $\theta_{\rm on}$ & $-3$ / $+3$ & analytic class thresholds on $\alpha$ \\
-$f_{\rm pilot}$ / $f_{\rm recheck}$ & $0.025$ / $0.20$ & probe-row fractions of the current block \\
-$\delta$ & $0.35$ & recheck margin around a probe threshold \\
-$\theta^{\rm probe}_{\rm dead}$ / $\theta^{\rm probe}_{\rm on}$ & $-2.5$ / $+3$ & sampled-$\hat\alpha$ thresholds for promotion / on-demotion \\
-$\theta_{\rm demote}$ & $-3$ & sampled-$\hat\alpha$ threshold for kink$\to$dead demotion \\
-$[\alpha^{\rm probe}_{\min}, \alpha^{\rm probe}_{\max}]$ & $[-4, +4]$ & only dead with $\alpha \ge -4$ (resp.\ on with $\alpha \le 4$) are probed \\
-$\alpha^{\rm demote}_{\max}$ & $-2.5$ & only kink with $\alpha \le -2.5$ are probed for demotion \\
-$L_{\rm pack}$ & $2..29$ & layers whose input matmul may be packed \\
-$t_{\rm nnz}$ & $3$ & prefix-width stop: expected nonzeros per row over the prefix \\
-ladder & $(0, 1, 2, 4, 8)$ & bucket caps on per-row prefix nonzeros; above $8$ = dense tail \\
-$s_{\min}$ & $8$ & minimum prefix width (below it: pilot falls back, continuation goes dense) \\
-$h_{\min}$ & $96$ & minimum hot-block width (keeps Strassen eligibility) \\
-$\alpha_{\rm cold}$ & $-1.88$ & fallback-carve analytic proxy ($\Phi(-1.88) \approx 0.03$) \\
-$k_{\min}$ / $k_{\max}$ & $8$ / $64$ & cold-set clamp of the pilot's fallback carve \\
-Strassen & dim $\ge 96$, rows $\ge 4096$, depth $\le 1$ & guard for the two-level recursion \\
-\bottomrule
-\end{tabular}
-\caption{All hyperparameters of the submitted estimator. $\alpha$ denotes the analytic normalized margin from the diagonal Gaussian pass; $\hat\alpha$ denotes a sampled estimate $\widehat{\mu}/\widehat{\sigma}$ over probe rows.}
-\label{tab:hyperparams}
-\end{table}
-
-\paragraph{Pilot pass.} The pilot pass checks a set of candidate neurons $C$ at layer $\ell$ using a small set of samples. It takes the first $r$ rows of each antithetic half ($r = \max(2, \lfloor f N \rfloor)$ for a block of $N$ samples, so rows $0..r{-}1$ and $N/2..N/2{+}r{-}1$), multiplies them by $W_\ell[A_{\ell-1}, C]$, and estimates each candidate's margin as $\hat\alpha_j = \widehat{\mu}_j / \max(\widehat{\sigma}_j, 10^{-6})$ from the empirical mean and standard deviation over those $2r$ rows. To decide against a threshold $\theta$, the estimator first classifies with the cheap $f_{\rm pilot}$ probe; any candidate that lands within $\delta$ of the threshold is considered too close to call and is re-probed with the larger $f_{\rm recheck}$ prefix, whose verdict is final.
-
-\begin{algorithm}[p]
-\caption{Submitted estimator (submission \submissionid): \texttt{predict(mlp)}}
-\label{alg:estimator}
-\begin{algorithmic}[1]
-\State Cast every $W_\ell$ to float32.
-\State \textbf{Analytic pass.} Propagate the diagonal Gaussian moments (\Cref{eq:pre-mean,eq:pre-var,eq:post-mean,eq:post-var}) through all 32 layers; record per layer the margins $\alpha_\ell$, the ADF mean rows $m_\ell$, and the classes dead ($\alpha < -3$), on ($\alpha > 3$), kink (otherwise). Active set $A_\ell$ = kink $\cup$ on.
-\State \textbf{Pilot block} ($N_0 = 10{,}240$; refinement on). Materialize half-block $P_{0:5120}$; layer 0 computes $Z = P W_0[:, A_0]$ once and forms $x = [\relu(Z); \relu(-Z)]$. Then for $\ell = 1..31$:
-\State \hskip1em \emph{Kink demotion} ($\ell \le 29$): probe kink columns with $\alpha_\ell \le -2.5$ against $\theta_{\rm demote} = -3$; columns with $\hat\alpha \le -3$ leave the active set.
-\State \hskip1em \emph{Dead promotion} ($\ell \le 29$, and again at $\ell = 30$): probe dead columns with $\alpha_\ell \ge -4$ against $\theta^{\rm probe}_{\rm dead} = -2.5$; columns with $\hat\alpha > -2.5$ join the kink set.
-\State \hskip1em \emph{On demotion} ($\ell = 30$ only): probe on columns with $\alpha_\ell \le 4$ against $\theta^{\rm probe}_{\rm on} = 3$; columns with $\hat\alpha \le 3$ become kink.
-\State \hskip1em \emph{Propagation} ($\ell \le 29$): sort $A_\ell$ by $\alpha_\ell$ ascending, the analytic stand-in for coldest-first. For $\ell \ge 2$, walk the running sum of $\Phi(\alpha_{\ell-1})$ over the sorted columns of $A_{\ell-1}$ and set the prefix width $s_p$ to the last position where it is still $\le 3$, clamped to $|A_{\ell-1}| - 96$. If $s_p \ge 8$, apply the packed multiply of \Cref{alg:pack} with the row order restored afterwards. Otherwise set $k_p = \#\{i \in A_{\ell-1} : \alpha_{\ell-1,i} < -1.88\}$ clamped to $[8, \min(64, |A_{\ell-1}| - 96)]$ and, if $k_p \ge 8$, apply the single-level fallback carve of \Cref{alg:pack} (row order restored), else $x \gets \relu(x\,W_\ell[A_{\ell-1}, A_\ell])$ densely. Record the fire census $c_{\ell,j} = \#\{r : x_{rj} > 0\}$ for $\ell = 1..28$.
-\State \hskip1em \emph{Fold} ($\ell = 30$): keep $x^{\rm pre} = x$; propagate kink columns as $x \gets \relu(x\,W_{30}[A_{29}, K_{30}])$; the layer-30 mean row combines the sampled kink means with the linear on means $\bar{x}^{\rm pre} W_{30}[A_{29}, O_{30}]$.
-\State \hskip1em \emph{Scored layer} ($\ell = 31$): kink pre-activations are $x\,W_{31}[K_{30}, K_{31}] + x^{\rm pre}\, (W_{30}[A_{29}, O_{30}]\, W_{31}[O_{30}, K_{31}])$ (the two-layer fold composed in the weights), then $\relu$ and average; on means are $\bar{a}_{30}[A_{30}]\, W_{31}[A_{30}, O_{31}]$ from the layer-30 mean row $\bar a_{30}$; dead neurons receive their analytic ADF means $m_{31}$.
-\State \textbf{Prefix planning.} For each consuming layer $j = 2..29$: sort the pilot fire counts $c_{j-1,\cdot}$ ascending, walk their running sum divided by $N_0$ (the expected nonzeros per row over the prefix), and set $s$ to the last position where it is still $\le 3$, clamped to $|A_{j-1}| - 96$; skip the layer entirely if $s < 8$. Reorder $A_{j-1}$ by ascending fire count. (The reorder is free: absolute neuron ids flow through the weight slices, so no data moves.)
-\State \textbf{Continuation block} ($N_1 = 74{,}752$; refinement off). Materialize half-block $P_{5120:42496}$ and run the same layer loop with the refined classes and \emph{no} probes; at planned layers apply the packed multiply of \Cref{alg:pack} with width $s$, leaving the row order permuted (only per-column means are read downstream); the fold and scored layer are handled as in the pilot block.
-\State \textbf{Output.} Row $\ell$ of the returned $(32, 256)$ array is the analytic ADF mean $m_\ell$ for $\ell = 0..30$ (intermediate rows are not scored), and for $\ell = 31$ the sample-count-weighted blend $(N_0\, \bar a^{\rm pilot}_{31} + N_1\, \bar a^{\rm cont}_{31}) / N$ plus the analytic means on the dead set.
-\end{algorithmic}
-\end{algorithm}
-
-\begin{algorithm}[p]
-\caption{Exact packed-prefix computation of $\relu(x W)$ (columns already coldest-first; prefix width $s$, ladder $(0, 1, 2, 4, 8)$)}
-\label{alg:pack}
-\begin{algorithmic}[1]
-\State $\mathrm{nnz}_r \gets \#\{j < s : x_{rj} > 0\}$ for every row $r$; assign row $r$ to the first ladder bucket whose cap satisfies $\mathrm{nnz}_r \le k_g$, and rows with $\mathrm{nnz}_r > 8$ to the dense tail.
-\State Build destination indices with one cumulative sum per bucket (buckets in ladder order, stable within a bucket) and scatter the rows into $x'$ with one \texttt{put\_along\_axis}. Reading each bucket's size is one host sync; the tail size is inferred. If every row lands in the tail, return $\relu(x W)$ densely.
-\State $H \gets \textsc{Strassen}(x'[:, s{:}],\, W[s{:}, :])$ \Comment{hot block, all rows}
-\State Bucket with cap $k_g = 0$ (rows $a..b$): emit $\relu(H[a{:}b])$ \Comment{the zero rectangle of \Cref{fig:prefixpack-blocks}, skipped outright}
-\State Bucket with cap $k_g > 0$ (rows $a..b$): $J \gets \texttt{argpartition}(x'[a{:}b, {:}s] > 0,\ s - k_g)[:, s-k_g{:}]$, a per-row superset of the true support (the extra picks are zeros); gather values $V_{rt} = x'_{a+r,\,J_{rt}}$ and weight rows $W[J_{rt}, :]$, contract $C_{ro} = \sum_t V_{rt} W_{J_{rt}, o}$ (einsum), emit $\relu(H[a{:}b] + C)$ \Comment{contiguous slice-add, no scatter-adds}
-\State Dense tail (rows $a..n$): emit $\relu(H[a{:}] + x'[a{:}, {:}s]\, W[{:}s, :])$; concatenate all emitted blocks in bucket order.
-\Statex \textbf{Restore variant} (pilot block): one inverse-permutation scatter puts the rows back in their original order, so the Sobol-prefix probe rows and the antithetic pairing are untouched. The continuation block skips this; only per-column means are read downstream.
-\Statex \textbf{Pilot fallback carve} (used when $s_p < 8 \le k_p$): support flags $s_r = [\exists\, j < k_p : x_{rj} > 0]$; one scatter puts support rows first ($n_{\rm sup}$ of them), $H$ as above over columns $k_p{:}$, one correction $x'[{:}n_{\rm sup}, {:}k_p]\, W[{:}k_p, :]$ lands as a slice-add, and the row order is restored. If no row has cold support, the cold columns are dropped from the matmul outright; if (nearly) all rows do, the multiply is dense.
-\end{algorithmic}
-\end{algorithm}
-
-\paragraph{Reproduction notes.} (i) The probe row counts are computed from the \emph{block} size: $256$/$2{,}048$ rows per antithetic half in the pilot block. (ii) The demotion, promotion, and on-probe steps mutate the class sets that the continuation block then uses; the continuation block runs no probes of its own. (iii) The Strassen routine pads odd dimensions with zeros, recurses once (two levels) when all half-blocks satisfy the guard (rows $\ge 4{,}096$, dims $\ge 96$, even), and falls back to dense multiplication below the guard; the hot-block product inside the packed multiply routes through it. (iv) The packed prefix, the fold, the coldest-first reorderings, and the float32 cast are all exact reroutings of the same sampled estimator: with them disabled, predictions change only at float-associativity level. (v) Per-neuron analytic quantities ($\alpha_\ell$, $m_\ell$) come from the diagonal Gaussian pass above with $\sigma$ floored at $10^{-6}$. (vi) The pilot's analytic fire probabilities $\Phi(\alpha)$ are computed by the metered \texttt{norm.cdf}, which returns float64 even on float32 input; the result is cast back to float32 immediately.
